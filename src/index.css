@@ -306,6 +306,7 @@ thead .sticky-col-id {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+  min-width: 0;
 }
 
 .topbar {
@@ -329,6 +330,9 @@ thead .sticky-col-id {
 .page-content {
   flex: 1;
   padding: var(--space-8);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 
 .mobile-menu-btn {

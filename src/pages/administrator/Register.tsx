@@ -185,7 +185,7 @@ export function Register() {
   if (loading) return <div className="card"><span className="spinner" /> Loading Matrix...</div>;
 
   return (
-    <div className="card" style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 120px)" }}>
+    <div className="card" style={{ display: "flex", flexDirection: "column", height: "calc(100vh - 120px)", width: "100%", overflow: "hidden" }}>
       <div className="card-header" style={{ flexShrink: 0 }}>
         <div>
           <h3>Register Matrix</h3>
