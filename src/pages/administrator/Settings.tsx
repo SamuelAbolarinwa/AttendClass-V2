@@ -19,8 +19,15 @@ export function Settings() {
   const [securityMsg, setSecurityMsg] = useState("");
   const [securityErr, setSecurityErr] = useState("");
 
+  // Proximity State
+  const [devices, setDevices] = useState<any[]>([]);
+  const [loadingDevices, setLoadingDevices] = useState(true);
+  const [savingDevice, setSavingDevice] = useState<string | null>(null);
+  const [deviceMsg, setDeviceMsg] = useState("");
+
   useEffect(() => {
     fetchSettings();
+    fetchDevices();
   }, []);
 
   const fetchSettings = async () => {
@@ -28,6 +35,13 @@ export function Settings() {
     const { data } = await supabase.from("app_settings").select("tracking_period_end_date").limit(1).single();
     if (data?.tracking_period_end_date) setEndDate(data.tracking_period_end_date);
     setLoadingSettings(false);
+  };
+
+  const fetchDevices = async () => {
+    setLoadingDevices(true);
+    const { data } = await supabase.from("devices").select("id, device_id, name, location, rssi_threshold_dbm").order("name");
+    if (data) setDevices(data);
+    setLoadingDevices(false);
   };
 
   const handleSaveSettings = async (e: React.FormEvent) => {
@@ -46,6 +60,26 @@ export function Settings() {
     else setSettingsMsg("Settings saved successfully.");
     
     setSavingSettings(false);
+  };
+
+  const handleUpdateDeviceThreshold = async (deviceId: string, newThreshold: number) => {
+    if (!account) return;
+    setSavingDevice(deviceId);
+    setDeviceMsg("");
+
+    const { data, error } = await supabase.rpc("platform_update_device_settings", {
+      p_token: account.token,
+      p_device_id: deviceId,
+      p_rssi_threshold_dbm: newThreshold
+    });
+
+    if (error) setDeviceMsg(`Error updating ${deviceId}: ${error.message}`);
+    else {
+      setDeviceMsg("Proximity threshold updated.");
+      fetchDevices();
+    }
+    
+    setSavingDevice(null);
   };
 
   const handleUpdatePassword = async (e: React.FormEvent) => {
@@ -110,6 +144,61 @@ export function Settings() {
                 {savingSettings ? <><span className="spinner" /> Saving...</> : "Save Settings"}
               </button>
             </form>
+          )}
+        </div>
+      </div>
+
+      {/* Proximity */}
+      <div className="card">
+        <div className="card-header">
+          <h3>Proximity Thresholds</h3>
+        </div>
+        <div className="card-body">
+          <p className="text-sm text-muted mb-4">
+            Minimum signal strength (dBm) — lower (more negative) numbers allow check-in from farther away. Current default: -80.
+          </p>
+          {deviceMsg && (
+            <div className={`alert ${deviceMsg.includes("Error") ? "alert-error" : "alert-success"} mb-4`}>
+              {deviceMsg}
+            </div>
+          )}
+          {loadingDevices ? (
+            <div className="spinner" />
+          ) : devices.length === 0 ? (
+            <p className="text-muted">No devices registered.</p>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+              {devices.map(d => (
+                <div key={d.id} style={{ display: "flex", gap: 16, alignItems: "center", background: "var(--color-bg-muted)", padding: 12, borderRadius: 8 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600 }}>{d.name || "Unnamed Device"}</div>
+                    <div className="text-xs text-muted">ID: {d.device_id} • Location: {d.location || "N/A"}</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input 
+                      type="number" 
+                      className="form-input" 
+                      style={{ width: 80, textAlign: "center" }}
+                      defaultValue={d.rssi_threshold_dbm}
+                      onBlur={(e) => {
+                        const val = parseInt(e.target.value, 10);
+                        if (!isNaN(val) && val !== d.rssi_threshold_dbm) {
+                          handleUpdateDeviceThreshold(d.device_id, val);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          (e.target as HTMLInputElement).blur();
+                        }
+                      }}
+                    />
+                    <span className="text-sm text-muted">dBm</span>
+                    {savingDevice === d.device_id && <span className="spinner" style={{ width: 16, height: 16, marginLeft: 8 }} />}
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
         </div>
       </div>

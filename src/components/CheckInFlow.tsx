@@ -65,6 +65,8 @@ export function CheckInFlow({ onClose, onSuccess }: Props) {
                 const serverErr = data?.error || error.message;
                 if (serverErr === "invalid_token") {
                   throw new Error("Invalid BLE token. Please move closer to the class device and try again.");
+                } else if (serverErr === "out_of_range") {
+                  throw new Error("Move closer to the device and try again.");
                 }
                 throw new Error(serverErr || "Check-in verification failed");
               }

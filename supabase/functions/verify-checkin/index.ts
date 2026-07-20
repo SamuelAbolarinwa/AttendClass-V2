@@ -37,7 +37,7 @@ serve(async (req) => {
     // Fetch device (using service role bypasses the column-level select revoke)
     const { data: devData, error: devErr } = await supabaseAdmin
       .from('devices')
-      .select('id, totp_secret_encrypted')
+      .select('id, totp_secret_encrypted, rssi_threshold_dbm')
       .eq('ble_short_code', ble_short_code)
       .single();
 
@@ -66,6 +66,11 @@ serve(async (req) => {
 
     if (!matched) {
       return new Response(JSON.stringify({ error: "invalid_token" }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 403 })
+    }
+
+    // Proximity Enforcement: only check AFTER token is verified
+    if (typeof devData.rssi_threshold_dbm === 'number' && rssi < devData.rssi_threshold_dbm) {
+      return new Response(JSON.stringify({ error: "out_of_range" }), { headers: { ...corsHeaders, 'Content-Type': 'application/json' }, status: 403 })
     }
 
     // Success! Check if already logged today

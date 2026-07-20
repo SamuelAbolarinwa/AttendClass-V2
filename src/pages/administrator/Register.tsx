@@ -197,13 +197,13 @@ export function Register() {
         </div>
       </div>
 
-      <div style={{ flex: 1, overflow: "auto", borderTop: "1px solid var(--color-border)" }}>
+      <div style={{ flex: 1, overflowX: "auto", overflowY: "auto", borderTop: "1px solid var(--color-border)", WebkitOverflowScrolling: "touch" }}>
         <table className="matrix-table" style={{ borderCollapse: "separate", borderSpacing: 0, width: "max-content", minWidth: "100%" }}>
           <thead>
             <tr>
-              <th style={{ position: "sticky", left: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 16px" }}>S/N</th>
-              <th style={{ position: "sticky", left: 50, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 16px", minWidth: 200 }}>Name</th>
-              <th style={{ position: "sticky", left: 250, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "2px solid var(--color-border)", padding: "12px 16px" }}>Identifier</th>
+              <th style={{ position: "sticky", left: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 8px", width: 40, minWidth: 40, textAlign: "center" }}>S/N</th>
+              <th style={{ position: "sticky", left: 40, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px", width: 120, minWidth: 120, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Name</th>
+              <th style={{ position: "sticky", left: 160, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 90, minWidth: 90, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", boxShadow: "4px 0 8px -4px rgba(0,0,0,0.15)" }}>ID</th>
               {workingDays.map(d => (
                 <th key={d} style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", minWidth: 40 }}>
                   <div style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", whiteSpace: "nowrap", fontSize: "11px", fontWeight: 500, color: cancelledDays.has(d) ? "var(--color-muted)" : "inherit" }}>
@@ -211,9 +211,9 @@ export function Register() {
                   </div>
                 </th>
               ))}
-              <th style={{ position: "sticky", right: 120, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px" }}>P</th>
-              <th style={{ position: "sticky", right: 80, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px" }}>A</th>
-              <th style={{ position: "sticky", right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 16px" }}>%</th>
+              <th style={{ position: "sticky", right: 100, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center", boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>P</th>
+              <th style={{ position: "sticky", right: 60, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center" }}>A</th>
+              <th style={{ position: "sticky", right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 60, textAlign: "center" }}>%</th>
             </tr>
           </thead>
           <tbody>
@@ -224,9 +224,9 @@ export function Register() {
 
               return (
                 <tr key={u.id}>
-                  <td style={{ position: "sticky", left: 0, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px 16px", color: "var(--color-muted)", fontSize: "13px" }}>{idx + 1}</td>
-                  <td style={{ position: "sticky", left: 50, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px 16px", fontWeight: 500, fontSize: "14px" }}>{u.full_name}</td>
-                  <td style={{ position: "sticky", left: 250, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "2px solid var(--color-border)", padding: "8px 16px" }}><code style={{ fontSize: "11px" }}>{u.identifier}</code></td>
+                  <td style={{ position: "sticky", left: 0, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", color: "var(--color-muted)", fontSize: "12px", textAlign: "center" }}>{idx + 1}</td>
+                  <td style={{ position: "sticky", left: 40, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px 12px", fontWeight: 500, fontSize: "13px", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.full_name}>{u.full_name}</td>
+                  <td style={{ position: "sticky", left: 160, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px 12px", maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", boxShadow: "4px 0 8px -4px rgba(0,0,0,0.15)" }} title={u.identifier}><code style={{ fontSize: "11px" }}>{u.identifier}</code></td>
                   
                   {workingDays.map(d => {
                     const isCancelled = cancelledDays.has(d);
@@ -256,7 +256,7 @@ export function Register() {
                     return (
                       <td 
                         key={d} 
-                        style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", textAlign: "center", color, backgroundColor: bg, cursor, userSelect: "none" }}
+                        style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", textAlign: "center", color, backgroundColor: bg, cursor, userSelect: "none", minWidth: 40 }}
                         onClick={() => {
                           if (!isCancelled && !isPreStart) handleToggle(u.id, d, isPresent);
                         }}
@@ -266,9 +266,9 @@ export function Register() {
                     );
                   })}
                   
-                  <td style={{ position: "sticky", right: 120, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "8px", textAlign: "center", color: "var(--color-success)", fontWeight: 600 }}>{stats.present}</td>
-                  <td style={{ position: "sticky", right: 80, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px", textAlign: "center", color: "var(--color-danger)", fontWeight: 600 }}>{stats.absent}</td>
-                  <td style={{ position: "sticky", right: 0, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px 16px", textAlign: "center", fontWeight: "bold" }}>
+                  <td style={{ position: "sticky", right: 100, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "8px", textAlign: "center", color: "var(--color-success)", fontWeight: 600, boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>{stats.present}</td>
+                  <td style={{ position: "sticky", right: 60, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px", textAlign: "center", color: "var(--color-danger)", fontWeight: 600 }}>{stats.absent}</td>
+                  <td style={{ position: "sticky", right: 0, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px 12px", textAlign: "center", fontWeight: "bold" }}>
                     {stats.percentage.toFixed(1)}%
                   </td>
                 </tr>
