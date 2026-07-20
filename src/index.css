@@ -199,6 +199,76 @@ a:hover { text-decoration: underline; }
   gap: var(--space-3);
 }
 
+/* ── Register Matrix Specifics ──────────────────────────────────────────── */
+.sticky-col-sn {
+  position: sticky !important;
+  left: 0 !important;
+  z-index: 5;
+  background: var(--color-bg);
+  min-width: 40px;
+  width: 40px;
+}
+
+.sticky-col-name {
+  position: sticky !important;
+  left: 40px !important;
+  z-index: 5;
+  background: var(--color-bg);
+  min-width: 200px;
+  max-width: 200px;
+  width: 200px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sticky-col-id {
+  position: sticky !important;
+  left: 240px !important;
+  z-index: 5;
+  background: var(--color-bg);
+  min-width: 120px;
+  width: 120px;
+  box-shadow: 4px 0 8px -4px rgba(0,0,0,0.15);
+}
+
+/* Mobile optimizations for sticky columns */
+@media (max-width: 768px) {
+  .sticky-col-sn {
+    min-width: 30px;
+    width: 30px;
+    padding-left: 4px !important;
+    padding-right: 4px !important;
+    font-size: 11px !important;
+  }
+  
+  .sticky-col-name {
+    left: 30px !important;
+    min-width: 100px;
+    max-width: 100px;
+    width: 100px;
+    font-size: 12px !important;
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+  
+  .sticky-col-id {
+    left: 130px !important;
+    min-width: 80px;
+    width: 80px;
+    font-size: 10px !important;
+    padding-left: 8px !important;
+    padding-right: 8px !important;
+  }
+}
+
+/* Header specific z-index */
+thead .sticky-col-sn,
+thead .sticky-col-name,
+thead .sticky-col-id {
+  z-index: 10;
+}
+
 .sidebar-user-avatar {
   width: 36px;
   height: 36px;

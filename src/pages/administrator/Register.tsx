@@ -201,19 +201,19 @@ export function Register() {
         <table className="matrix-table" style={{ borderCollapse: "separate", borderSpacing: 0, width: "max-content", minWidth: "100%" }}>
           <thead>
             <tr>
-              <th style={{ position: "sticky", left: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 8px", width: 40, minWidth: 40, textAlign: "center" }}>S/N</th>
-              <th style={{ position: "sticky", left: 40, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px", width: 120, minWidth: 120, maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>Name</th>
-              <th style={{ position: "sticky", left: 160, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 90, minWidth: 90, maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", boxShadow: "4px 0 8px -4px rgba(0,0,0,0.15)" }}>ID</th>
+              <th className="sticky-col-sn" style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 8px", textAlign: "center" }}>S/N</th>
+              <th className="sticky-col-name" style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px" }}>Name</th>
+              <th className="sticky-col-id" style={{ top: 0, borderBottom: "1px solid var(--color-border)", padding: "12px" }}>ID</th>
               {workingDays.map(d => (
-                <th key={d} style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", minWidth: 40 }}>
+                <th key={d} style={{ position: "sticky", top: 0, zIndex: 9, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", minWidth: 40 }}>
                   <div style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", whiteSpace: "nowrap", fontSize: "11px", fontWeight: 500, color: cancelledDays.has(d) ? "var(--color-muted)" : "inherit" }}>
                     {d.slice(5)} {cancelledDays.has(d) && "(H)"}
                   </div>
                 </th>
               ))}
-              <th style={{ position: "sticky", right: 100, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center", boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>P</th>
-              <th style={{ position: "sticky", right: 60, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center" }}>A</th>
-              <th style={{ position: "sticky", right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 60, textAlign: "center" }}>%</th>
+              <th style={{ position: "sticky", top: 0, right: 100, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center", boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>P</th>
+              <th style={{ position: "sticky", top: 0, right: 60, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center" }}>A</th>
+              <th style={{ position: "sticky", top: 0, right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 60, textAlign: "center" }}>%</th>
             </tr>
           </thead>
           <tbody>
@@ -224,9 +224,11 @@ export function Register() {
 
               return (
                 <tr key={u.id}>
-                  <td style={{ position: "sticky", left: 0, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", color: "var(--color-muted)", fontSize: "12px", textAlign: "center" }}>{idx + 1}</td>
-                  <td style={{ position: "sticky", left: 40, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px 12px", fontWeight: 500, fontSize: "13px", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={u.full_name}>{u.full_name}</td>
-                  <td style={{ position: "sticky", left: 160, zIndex: 5, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "8px 12px", maxWidth: 90, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", boxShadow: "4px 0 8px -4px rgba(0,0,0,0.15)" }} title={u.identifier}><code style={{ fontSize: "11px" }}>{u.identifier}</code></td>
+                  <td className="sticky-col-sn" style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", color: "var(--color-muted)", fontSize: "12px", textAlign: "center" }}>{idx + 1}</td>
+                  <td className="sticky-col-name" style={{ borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px 12px", fontWeight: 500, fontSize: "13px" }} title={u.full_name}>{u.full_name}</td>
+                  <td className="sticky-col-id" style={{ borderBottom: "1px solid var(--color-border)", padding: "8px 12px" }} title={u.identifier}>
+                    <code style={{ fontSize: "11px", display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{u.identifier}</code>
+                  </td>
                   
                   {workingDays.map(d => {
                     const isCancelled = cancelledDays.has(d);
