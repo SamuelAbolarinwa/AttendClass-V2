@@ -19,6 +19,7 @@ export function Register() {
   const [workingDays, setWorkingDays] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [toggling, setToggling] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   useEffect(() => {
     fetchData();
@@ -101,7 +102,7 @@ export function Register() {
     });
 
     if (error) {
-      alert(`Failed to toggle attendance: ${error.message}`);
+      setErrorMessage(`Failed to toggle attendance: ${error.message}`);
       fetchData(); // Revert on failure
     }
     setToggling(false);
@@ -178,9 +179,37 @@ export function Register() {
       saveAs(new Blob([buffer]), `Attendance_Register_${new Date().toISOString().split("T")[0]}.xlsx`);
     } catch (e) {
       console.error(e);
-      alert("Failed to export XLSX. Ensure exceljs and file-saver are installed via pnpm.");
+      setErrorMessage("Failed to export XLSX. Ensure exceljs and file-saver are installed via pnpm.");
     }
   };
+
+  const weeks: { title: string, colSpan: number, dates: string[] }[] = [];
+  let currentWeek: string[] = [];
+  let weekIndex = 1;
+
+  workingDays.forEach((d) => {
+    const dateObj = new Date(d);
+    const dayOfWeek = dateObj.getUTCDay();
+    
+    if (currentWeek.length > 0) {
+      const prevDateObj = new Date(currentWeek[currentWeek.length - 1]);
+      const prevDayOfWeek = prevDateObj.getUTCDay();
+      const diffTime = dateObj.getTime() - prevDateObj.getTime();
+      const diffDays = Math.round(diffTime / (1000 * 60 * 60 * 24));
+      
+      if (dayOfWeek <= prevDayOfWeek || diffDays >= 7) {
+        weeks.push({ title: `Week ${weekIndex}`, colSpan: currentWeek.length, dates: currentWeek });
+        currentWeek = [];
+        weekIndex++;
+      }
+    }
+    currentWeek.push(d);
+  });
+  if (currentWeek.length > 0) {
+    weeks.push({ title: `Week ${weekIndex}`, colSpan: currentWeek.length, dates: currentWeek });
+  }
+
+  const dayAbbreviations = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
   if (loading) return <div className="card"><span className="spinner" /> Loading Matrix...</div>;
 
@@ -201,19 +230,30 @@ export function Register() {
         <table className="matrix-table" style={{ borderCollapse: "separate", borderSpacing: 0, width: "max-content", minWidth: "100%" }}>
           <thead>
             <tr>
-              <th className="sticky-col-sn" style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 8px", textAlign: "center" }}>S/N</th>
-              <th className="sticky-col-name" style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px" }}>Name</th>
-              <th className="sticky-col-id" style={{ top: 0, borderBottom: "1px solid var(--color-border)", padding: "12px" }}>ID</th>
-              {workingDays.map(d => (
-                <th key={d} style={{ position: "sticky", top: 0, zIndex: 9, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", minWidth: 40 }}>
-                  <div style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", whiteSpace: "nowrap", fontSize: "11px", fontWeight: 500, color: cancelledDays.has(d) ? "var(--color-muted)" : "inherit" }}>
-                    {d.slice(5)} {cancelledDays.has(d) && "(H)"}
-                  </div>
+              <th className="sticky-col-sn" rowSpan={2} style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px 8px", textAlign: "center" }}>S/N</th>
+              <th className="sticky-col-name" rowSpan={2} style={{ top: 0, borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "12px" }}>Name</th>
+              <th className="sticky-col-id" rowSpan={2} style={{ top: 0, borderBottom: "1px solid var(--color-border)", padding: "12px" }}>ID</th>
+              {weeks.map(w => (
+                <th key={w.title} colSpan={w.colSpan} style={{ position: "sticky", top: 0, zIndex: 9, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", fontSize: "13px" }}>
+                  {w.title}
                 </th>
               ))}
-              <th style={{ position: "sticky", top: 0, right: 100, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center", boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>P</th>
-              <th style={{ position: "sticky", top: 0, right: 60, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center" }}>A</th>
-              <th style={{ position: "sticky", top: 0, right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 60, textAlign: "center" }}>%</th>
+              <th rowSpan={2} style={{ position: "sticky", top: 0, right: 100, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderLeft: "2px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center", boxShadow: "-4px 0 8px -4px rgba(0,0,0,0.1)" }}>P</th>
+              <th rowSpan={2} style={{ position: "sticky", top: 0, right: 60, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px 8px", width: 40, textAlign: "center" }}>A</th>
+              <th rowSpan={2} style={{ position: "sticky", top: 0, right: 0, zIndex: 10, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", padding: "12px", width: 60, textAlign: "center" }}>%</th>
+            </tr>
+            <tr>
+              {workingDays.map(d => {
+                const dayAbbr = dayAbbreviations[new Date(d).getUTCDay()];
+                return (
+                  <th key={d} style={{ position: "sticky", top: 37, zIndex: 9, background: "var(--color-bg)", borderBottom: "1px solid var(--color-border)", borderRight: "1px solid var(--color-border)", padding: "8px", textAlign: "center", minWidth: 40 }}>
+                    <div style={{ whiteSpace: "nowrap", fontSize: "11px", fontWeight: 500, color: cancelledDays.has(d) ? "var(--color-muted)" : "inherit" }}>
+                      <div>{dayAbbr}</div>
+                      <div>{d.slice(5)} {cancelledDays.has(d) && "(H)"}</div>
+                    </div>
+                  </th>
+                );
+              })}
             </tr>
           </thead>
           <tbody>
@@ -279,6 +319,23 @@ export function Register() {
           </tbody>
         </table>
       </div>
+
+      {errorMessage && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <h2>Error</h2>
+              <button className="modal-close" onClick={() => setErrorMessage(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>{errorMessage}</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-primary" onClick={() => setErrorMessage(null)}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

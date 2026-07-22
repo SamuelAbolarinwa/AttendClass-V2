@@ -12,6 +12,7 @@ export function CancelledDays() {
   const { account } = useAuth();
   const [days, setDays] = useState<CancelledDay[]>([]);
   const [loading, setLoading] = useState(true);
+  const [dayToRestore, setDayToRestore] = useState<string | null>(null);
 
   // Form State
   const [mode, setMode] = useState<"single" | "range" | "multiple">("single");
@@ -39,9 +40,12 @@ export function CancelledDays() {
     setLoading(false);
   };
 
-  const handleDelete = async (id: string) => {
+  const handleRestore = (id: string) => {
+    setDayToRestore(id);
+  };
+
+  const executeRestore = async (id: string) => {
     if (!account) return;
-    if (!window.confirm("Are you sure you want to restore this day? It will now count towards attendance.")) return;
     
     await supabase.rpc("platform_delete_cancelled_day", { p_token: account.token, p_id: id });
     fetchDays();
@@ -203,7 +207,7 @@ export function CancelledDays() {
                     <td style={{ fontWeight: 500 }}>{d.cancelled_date}</td>
                     <td className="text-muted">{d.reason || "—"}</td>
                     <td style={{ textAlign: "right" }}>
-                      <button className="btn btn-ghost btn-sm" style={{ color: "var(--color-danger)" }} onClick={() => handleDelete(d.id)}>
+                      <button className="btn btn-ghost btn-sm" style={{ color: "var(--color-danger)" }} onClick={() => handleRestore(d.id)}>
                         Restore
                       </button>
                     </td>
@@ -214,6 +218,28 @@ export function CancelledDays() {
           )}
         </div>
       </div>
+
+      {dayToRestore && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <h2>Confirm Restore</h2>
+              <button className="modal-close" onClick={() => setDayToRestore(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>Are you sure you want to restore this day? It will now count towards attendance.</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-secondary" onClick={() => setDayToRestore(null)}>Cancel</button>
+              <button className="btn btn-danger" onClick={() => {
+                const id = dayToRestore;
+                setDayToRestore(null);
+                executeRestore(id);
+              }}>Restore Day</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

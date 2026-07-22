@@ -3,6 +3,7 @@ import { supabase } from "../lib/supabase";
 import { useAuth } from "../contexts/AuthContext";
 import { CheckInFlow } from "../components/CheckInFlow";
 import { getWorkingDays, isCountableDay, calculateAttendanceStats } from "../utils/attendanceHelpers";
+import { AttendanceHeatmap } from "../components/AttendanceHeatmap";
 
 export function UserDashboard() {
   const { account } = useAuth();
@@ -11,6 +12,9 @@ export function UserDashboard() {
   const [stats, setStats] = useState({ present: 0, absent: 0, percentage: 0 });
   const [showCheckIn, setShowCheckIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [trackingStart, setTrackingStart] = useState<string>("");
+  const [endDate, setEndDate] = useState<Date>(new Date());
+  const [cancelledDays, setCancelledDays] = useState<Set<string>>(new Set());
 
   const fetchDashboardData = async () => {
     if (!account) return;
@@ -55,13 +59,17 @@ export function UserDashboard() {
 
       // 5. Calculate Stats
       const trackingStartStr = profileData.tracking_start_date || profileData.created_at.split("T")[0];
-      const endDate = settingsData?.tracking_period_end_date ? new Date(settingsData.tracking_period_end_date) : new Date();
+      const endDateObj = settingsData?.tracking_period_end_date ? new Date(settingsData.tracking_period_end_date) : new Date();
+      
+      setTrackingStart(trackingStartStr);
+      setEndDate(endDateObj);
+      setCancelledDays(cancelledSet);
       
       let presentCount = 0;
       let absentCount = 0;
       
       const today = new Date();
-      const end = endDate < today ? endDate : today;
+      const end = endDateObj < today ? endDateObj : today;
 
       // Count working days
       for (let d = new Date(trackingStartStr); d <= end; d.setDate(d.getDate() + 1)) {
@@ -137,6 +145,16 @@ export function UserDashboard() {
           <div style={{ fontSize: "2.5rem", fontWeight: 700, color: "var(--color-text)" }}>{loading ? "-" : `${stats.percentage.toFixed(1)}%`}</div>
         </div>
       </div>
+
+      {/* Heatmap */}
+      {!loading && trackingStart && (
+        <AttendanceHeatmap
+          logs={logs}
+          trackingStartDate={trackingStart}
+          endDate={endDate}
+          cancelledDays={cancelledDays}
+        />
+      )}
 
       {/* History Table */}
       <div className="card">

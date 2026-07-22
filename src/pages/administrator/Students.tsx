@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabase";
+import { useAuth } from "../../contexts/AuthContext";
 import { AddStudentModal } from "../../components/AddStudentModal";
 
 interface Student {
@@ -11,9 +12,13 @@ interface Student {
 }
 
 export function Students() {
+  const { account } = useAuth();
   const [students, setStudents] = useState<Student[]>([]);
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
+  const [resetResult, setResetResult] = useState<{name: string, password: string} | null>(null);
+  const [studentToReset, setStudentToReset] = useState<Student | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const fetchStudents = async () => {
     setLoading(true);
@@ -36,6 +41,32 @@ export function Students() {
   const handleModalClose = (didAdd: boolean) => {
     setModalOpen(false);
     if (didAdd) fetchStudents();
+  };
+
+  const handleResetPassword = (student: Student) => {
+    setStudentToReset(student);
+  };
+
+  const executeResetPassword = async (student: Student) => {
+    if (!account) return;
+
+    try {
+      const { data, error } = await supabase.rpc("platform_admin", {
+        p_token: account.token,
+        p_op: "resetPassword",
+        p_args: { account_id: student.id }
+      });
+
+      if (error) throw error;
+      
+      const res = data as any;
+      if (!res.ok) throw new Error(res.error || "Failed to reset password");
+
+      setResetResult({ name: student.full_name, password: res.new_default_password });
+      fetchStudents();
+    } catch (err: any) {
+      setErrorMessage(`Error resetting password: ${err.message}`);
+    }
   };
 
   return (
@@ -69,6 +100,7 @@ export function Students() {
                   <th>Matric Number</th>
                   <th>Status</th>
                   <th>Added</th>
+                  <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -90,6 +122,14 @@ export function Students() {
                     <td className="text-muted text-sm">
                       {new Date(s.created_at).toLocaleDateString()}
                     </td>
+                    <td>
+                      <button 
+                        className="btn btn-secondary btn-sm"
+                        onClick={() => handleResetPassword(s)}
+                      >
+                        Reset Password
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -99,6 +139,69 @@ export function Students() {
       </div>
 
       {modalOpen && <AddStudentModal onClose={handleModalClose} />}
+
+      {studentToReset && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <h2>Confirm Reset</h2>
+              <button className="modal-close" onClick={() => setStudentToReset(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>Are you sure you want to reset the password for <strong>{studentToReset.full_name}</strong>?</p>
+              <p className="text-sm text-muted mt-2">They will be forced to change it on their next login.</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-secondary" onClick={() => setStudentToReset(null)}>Cancel</button>
+              <button className="btn btn-danger" onClick={() => {
+                const s = studentToReset;
+                setStudentToReset(null);
+                executeResetPassword(s);
+              }}>Reset Password</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {errorMessage && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <h2>Error</h2>
+              <button className="modal-close" onClick={() => setErrorMessage(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>{errorMessage}</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-primary" onClick={() => setErrorMessage(null)}>OK</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {resetResult && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 400 }}>
+            <div className="modal-header">
+              <h2>Password Reset Successful</h2>
+              <button className="modal-close" onClick={() => setResetResult(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>The password for <strong>{resetResult.name}</strong> has been reset to the default.</p>
+              <div style={{ margin: "var(--space-4) 0", padding: "var(--space-3)", background: "var(--color-bg)", borderRadius: "var(--radius-md)", border: "1px solid var(--color-border)", textAlign: "center" }}>
+                <code style={{ fontSize: "var(--text-lg)", fontWeight: 700 }}>{resetResult.password}</code>
+              </div>
+              <p className="text-sm text-muted">
+                Please securely relay this to the user. They will be forced to change this password on their next login.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn btn-primary" onClick={() => setResetResult(null)}>Done</button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }
