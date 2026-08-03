@@ -12,22 +12,40 @@ export function useFaceDetection() {
 
   // Load face-api models
   useEffect(() => {
+    let isMounted = true;
     async function loadModels() {
       try {
         const MODEL_URL = "/models";
+        let loadedCount = 0;
+        const totalModels = 3;
+        
+        const updateProgress = () => {
+          loadedCount++;
+          if (isMounted && loadedCount < totalModels) {
+            setStatus(`Loading face verification models (${loadedCount}/${totalModels})...`);
+          }
+        };
+
+        // If they are already preloaded, this will be very fast due to face-api internal caching
+        setStatus(`Loading face verification models (0/${totalModels})...`);
+
         await Promise.all([
-          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL).then(updateProgress),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL).then(updateProgress),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL).then(updateProgress),
         ]);
+        
+        if (!isMounted) return;
         setModelsLoaded(true);
         setStatus("Models loaded. Requesting camera access...");
       } catch (err) {
+        if (!isMounted) return;
         console.error("Failed to load models", err);
         setError("Failed to load face detection models. Are the weights in /public/models?");
       }
     }
     loadModels();
+    return () => { isMounted = false; };
   }, []);
 
   // Start webcam

@@ -4,11 +4,23 @@ import { useAuth } from "../contexts/AuthContext";
 import { CheckInFlow } from "../components/CheckInFlow";
 import { getWorkingDays, isCountableDay, calculateAttendanceStats } from "../utils/attendanceHelpers";
 import { AttendanceHeatmap } from "../components/AttendanceHeatmap";
+import * as faceapi from "@vladmandic/face-api";
 
 export function UserDashboard() {
   const { account } = useAuth();
   const [loading, setLoading] = useState(true);
   const [logs, setLogs] = useState<any[]>([]);
+
+  useEffect(() => {
+    // Silently preload models in the background so they are ready by the time the user clicks "Check In"
+    const MODEL_URL = "/models";
+    Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
+    ]).catch(err => console.warn("Failed to preload models silently:", err));
+  }, []);
+
   const [stats, setStats] = useState({ present: 0, absent: 0, percentage: 0 });
   const [showCheckIn, setShowCheckIn] = useState(false);
   const [error, setError] = useState<string | null>(null);

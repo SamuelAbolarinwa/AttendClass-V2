@@ -14,6 +14,8 @@ supabase/
         └── index.ts                   # ESP32 CSV upload endpoint
 ```
 
+> **Mobile App:** The React Native mobile client for this project is located in the `mobile-app/` directory for convenience, but it is version-controlled independently at [Ayomide-16/AttendClass-Mobile](https://github.com/Ayomide-16/AttendClass-Mobile) and is intentionally excluded from this repository's git tracking.
+
 ---
 
 ## Edge Functions
