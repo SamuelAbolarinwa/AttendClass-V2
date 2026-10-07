@@ -35,9 +35,39 @@ function base64ToBytes(b64: string): Uint8Array {
   return bytes;
 }
 
-/** Convert ASN.1 DER ECDSA signature into 64-byte raw (R || S) format for WebCrypto */
+const SPKI_P256_PREFIX_HEX = "3059301306072a8648ce3d020106082a8648ce3d030107034200";
+const SECP256R1_N = BigInt("0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+const SECP256R1_HALF_N = SECP256R1_N >> 1n;
+
+/** Validate uncompressed NIST P-256 SPKI public key (91 bytes) */
+function validateSpkiP256(pubKeyBytes: Uint8Array): boolean {
+  if (pubKeyBytes.length !== 91) return false;
+  let prefixHex = "";
+  for (let i = 0; i < 26; i++) {
+    prefixHex += pubKeyBytes[i].toString(16).padStart(2, "0");
+  }
+  if (prefixHex !== SPKI_P256_PREFIX_HEX) return false;
+  if (pubKeyBytes[26] !== 0x04) return false;
+  return true;
+}
+
+/** Convert ASN.1 DER ECDSA signature into 64-byte raw (R || S) format for WebCrypto with low-S canonicality */
 function derToCompactSignature(derBytes: Uint8Array): Uint8Array {
-  if (derBytes.length === 64) return derBytes; // already compact IEEE P1363
+  if (derBytes.length === 64) {
+    const sHex = Array.from(derBytes.subarray(32, 64)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    const s = BigInt("0x" + sHex);
+    if (s > SECP256R1_HALF_N) {
+      const canonicalS = SECP256R1_N - s;
+      const res = new Uint8Array(derBytes);
+      const sCleanHex = canonicalS.toString(16).padStart(64, "0");
+      for (let i = 0; i < 32; i++) {
+        res[32 + i] = parseInt(sCleanHex.substr(i * 2, 2), 16);
+      }
+      return res;
+    }
+    return derBytes;
+  }
+
   let offset = 2;
   if (derBytes[0] !== 0x30) throw new Error("Invalid ASN.1 DER sequence");
   if (derBytes[1] & 0x80) {
@@ -57,7 +87,35 @@ function derToCompactSignature(derBytes: Uint8Array): Uint8Array {
   raw.set(rClean, 32 - rClean.length);
   const sClean = (sBytes[0] === 0x00 && sBytes.length === 33) ? sBytes.subarray(1) : sBytes;
   raw.set(sClean, 64 - sClean.length);
+
+  const sHex = Array.from(raw.subarray(32, 64)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const s = BigInt("0x" + sHex);
+  if (s > SECP256R1_HALF_N) {
+    const canonicalS = SECP256R1_N - s;
+    const sCleanHex = canonicalS.toString(16).padStart(64, "0");
+    for (let i = 0; i < 32; i++) {
+      raw[32 + i] = parseInt(sCleanHex.substr(i * 2, 2), 16);
+    }
+  }
   return raw;
+}
+
+/** Convert 64-byte raw (R || S) signature into ASN.1 DER format */
+function compactToDerSignature(compactBytes: Uint8Array): Uint8Array {
+  if (compactBytes.length !== 64) {
+    throw new Error(`Expected 64-byte signature, got ${compactBytes.length}`);
+  }
+  function toIntegerDer(bytes: Uint8Array): number[] {
+    let start = 0;
+    while (start < bytes.length - 1 && bytes[start] === 0) start++;
+    const trimmed = Array.from(bytes.subarray(start));
+    if (trimmed[0] >= 0x80) trimmed.unshift(0x00);
+    return [0x02, trimmed.length, ...trimmed];
+  }
+  const rDer = toIntegerDer(compactBytes.subarray(0, 32));
+  const sDer = toIntegerDer(compactBytes.subarray(32, 64));
+  const body = [...rDer, ...sDer];
+  return new Uint8Array([0x30, body.length, ...body]);
 }
 
 /** Verify ECDSA P-256 SHA-256 signature against X.509 SPKI public key */
@@ -68,6 +126,10 @@ async function verifyP256Signature(
 ): Promise<boolean> {
   try {
     const pubKeyBytes = base64ToBytes(publicKeySpkiBase64);
+    if (!validateSpkiP256(pubKeyBytes)) {
+      console.error("Invalid SPKI public key structure or curve");
+      return false;
+    }
     const sigBytes = base64ToBytes(signatureBase64);
     const compactSig = derToCompactSignature(sigBytes);
     const msgBytes = new TextEncoder().encode(canonicalMessage);
@@ -130,6 +192,7 @@ interface ProcessResult {
 async function processSignedAttendanceRow(
   supabase: SupabaseClient,
   raw: Record<string, string>,
+  uploadingTerminalId: string,
 ): Promise<ProcessResult> {
   const eventId = raw.event_id?.trim();
   const matric = raw.matric_number?.trim();
@@ -153,14 +216,45 @@ async function processSignedAttendanceRow(
     return { ok: false, warning: `Missing signature or public_key for ${matric}` };
   }
 
-  // 1. Idempotency Check: skip duplicate event_id safely
+  // 0. Terminal Matching: uploading terminal must match the record’s terminal_id
+  if (terminalId !== uploadingTerminalId) {
+    return {
+      ok: false,
+      warning: `TERMINAL_MISMATCH: Record terminal ${terminalId} does not match uploading terminal ${uploadingTerminalId}`,
+    };
+  }
+
+  // Delimiter validation: security-sensitive fields must not contain pipe or newline
+  const fieldsToValidate = [eventId, credentialId, credentialVersion, matric, terminalId, sessionId || "", challenge, timestampSource];
+  for (const f of fieldsToValidate) {
+    if (f.includes("|") || f.includes("\n") || f.includes("\r")) {
+      return { ok: false, warning: "INVALID_DELIMITER: Canonical field cannot contain pipe or newline characters" };
+    }
+  }
+
+  // 1. Idempotency & Conflict Check: detect conflicting duplicate event_id
   const { data: existingLog } = await supabase
     .from("attendance_logs")
-    .select("id")
+    .select("id, student_id, terminal_id, method")
     .eq("event_id", eventId)
     .maybeSingle();
 
   if (existingLog) {
+    const { data: stdProfile } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("matric_number", matric)
+      .maybeSingle();
+
+    if (
+      (stdProfile && existingLog.student_id !== stdProfile.id) ||
+      (existingLog.terminal_id && existingLog.terminal_id !== terminalId)
+    ) {
+      return {
+        ok: false,
+        warning: `EVENT_ID_CONFLICT: Duplicate event_id ${eventId} submitted with conflicting student or terminal data`,
+      };
+    }
     return { ok: true, duplicate: true };
   }
 
@@ -464,7 +558,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
     rowsReceived = records.length;
     for (const record of records) {
-      const result = await processSignedAttendanceRow(supabase, record);
+      const result = await processSignedAttendanceRow(supabase, record, device.device_id);
       if (result.ok) {
         if (result.duplicate) {
           duplicates++;
