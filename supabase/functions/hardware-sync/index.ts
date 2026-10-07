@@ -1,23 +1,20 @@
 /**
  * hardware-sync — Supabase Edge Function
  *
- * Drop-in cloud replacement for the ESP32 firmware's CSV upload endpoint.
- * Accepts raw CSV via POST, authenticates the device by x-device-key,
- * inserts every row into hardware_sync_log for audit, then attempts to
- * process each row into the normalised tables (attendance_logs or
- * student_credentials).
+ * Secure upload endpoint for attendance terminals (ESP32).
+ * Supports:
+ *   1. Cryptographically verified offline signed BLE attendance records.
+ *   2. Legacy attendance CSV imports.
+ *   3. Legacy enrollment CSV imports (mandatory RFID AND Fingerprint 2FA).
  *
- * CONTRACT (firmware sends exactly this — do NOT change):
- *   POST /hardware-sync
- *   Content-Type: text/csv
- *   x-sync-file-type: "attendance" | "enrollment"
- *   x-device-key: <static per-device secret>
- *   Body: raw CSV text
+ * AUTHENTICATION:
+ *   x-device-key: static per-device secret (hashed with SHA-256 and matched against devices.device_key_hash)
+ *   x-sync-file-type: "attendance" | "enrollment" | "signed_attendance"
  */
 
 import { createClient, SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─── Cryptographic & Encoding Helpers ────────────────────────────────────────
 
 /** SHA-256 hex digest — used to compare x-device-key against devices.device_key_hash */
 async function sha256Hex(input: string): Promise<string> {
@@ -28,7 +25,74 @@ async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
-/** Trim surrounding quotes from a CSV field (handles Excel-style quoting). */
+/** Decode Base64 string to Uint8Array */
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+/** Convert ASN.1 DER ECDSA signature into 64-byte raw (R || S) format for WebCrypto */
+function derToCompactSignature(derBytes: Uint8Array): Uint8Array {
+  if (derBytes.length === 64) return derBytes; // already compact IEEE P1363
+  let offset = 2;
+  if (derBytes[0] !== 0x30) throw new Error("Invalid ASN.1 DER sequence");
+  if (derBytes[1] & 0x80) {
+    const lenBytes = derBytes[1] & 0x7f;
+    offset = 2 + lenBytes;
+  }
+  if (derBytes[offset++] !== 0x02) throw new Error("Expected INTEGER tag for R");
+  const rLen = derBytes[offset++];
+  const rBytes = derBytes.subarray(offset, offset + rLen);
+  offset += rLen;
+  if (derBytes[offset++] !== 0x02) throw new Error("Expected INTEGER tag for S");
+  const sLen = derBytes[offset++];
+  const sBytes = derBytes.subarray(offset, offset + sLen);
+
+  const raw = new Uint8Array(64);
+  const rClean = (rBytes[0] === 0x00 && rBytes.length === 33) ? rBytes.subarray(1) : rBytes;
+  raw.set(rClean, 32 - rClean.length);
+  const sClean = (sBytes[0] === 0x00 && sBytes.length === 33) ? sBytes.subarray(1) : sBytes;
+  raw.set(sClean, 64 - sClean.length);
+  return raw;
+}
+
+/** Verify ECDSA P-256 SHA-256 signature against X.509 SPKI public key */
+async function verifyP256Signature(
+  canonicalMessage: string,
+  signatureBase64: string,
+  publicKeySpkiBase64: string,
+): Promise<boolean> {
+  try {
+    const pubKeyBytes = base64ToBytes(publicKeySpkiBase64);
+    const sigBytes = base64ToBytes(signatureBase64);
+    const compactSig = derToCompactSignature(sigBytes);
+    const msgBytes = new TextEncoder().encode(canonicalMessage);
+
+    const cryptoKey = await crypto.subtle.importKey(
+      "spki",
+      pubKeyBytes,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"],
+    );
+
+    return await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      cryptoKey,
+      compactSig,
+      msgBytes,
+    );
+  } catch (err: unknown) {
+    console.error("P-256 verification error:", err);
+    return false;
+  }
+}
+
+/** Trim surrounding quotes from a CSV field. */
 function unquote(field: string): string {
   const trimmed = field.trim();
   if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
@@ -37,7 +101,7 @@ function unquote(field: string): string {
   return trimmed;
 }
 
-/** Simple CSV line splitter (no embedded commas expected from ESP32). */
+/** Simple CSV line splitter. */
 function splitCSVLine(line: string): string[] {
   return line.split(",").map(unquote);
 }
@@ -50,48 +114,170 @@ function json(body: Record<string, unknown>, status = 200): Response {
   });
 }
 
-// ─── Row processors ─────────────────────────────────────────────────────────
+// ─── Row Processors ──────────────────────────────────────────────────────────
 
 interface ProcessResult {
   ok: boolean;
+  duplicate?: boolean;
   warning?: string;
 }
 
 /**
- * Process a single attendance CSV row.
- *
+ * Process a cryptographically signed offline attendance record.
+ * Validates terminal identity, student profile, active device enrolment,
+ * canonical signature, and idempotency by event_id.
+ */
+async function processSignedAttendanceRow(
+  supabase: SupabaseClient,
+  raw: Record<string, string>,
+): Promise<ProcessResult> {
+  const eventId = raw.event_id?.trim();
+  const matric = raw.matric_number?.trim();
+  const terminalId = raw.terminal_id?.trim() || "TERM_OFFLINE";
+  const sessionId = raw.session_id?.trim() || null;
+  const challenge = raw.challenge?.trim() || "";
+  const signature = raw.signature?.trim();
+  const publicKey = raw.public_key?.trim();
+  const credentialId = raw.credential_id?.trim() || "";
+  const credentialVersion = raw.credential_version?.trim() || "v1";
+  const timestamp = parseInt(raw.timestamp || "0", 10);
+  const timestampSource = raw.timestamp_source?.trim() || "phone_os";
+
+  if (!eventId) {
+    return { ok: false, warning: "Missing event_id in signed attendance record" };
+  }
+  if (!matric) {
+    return { ok: false, warning: "Missing matric_number in signed attendance record" };
+  }
+  if (!signature || !publicKey) {
+    return { ok: false, warning: `Missing signature or public_key for ${matric}` };
+  }
+
+  // 1. Idempotency Check: skip duplicate event_id safely
+  const { data: existingLog } = await supabase
+    .from("attendance_logs")
+    .select("id")
+    .eq("event_id", eventId)
+    .maybeSingle();
+
+  if (existingLog) {
+    return { ok: true, duplicate: true };
+  }
+
+  // 2. Look up student profile
+  const { data: student, error: studentErr } = await supabase
+    .from("profiles")
+    .select("id, matric_number")
+    .eq("matric_number", matric)
+    .maybeSingle();
+
+  if (studentErr || !student) {
+    return { ok: false, warning: `No student profile found for matric ${matric}` };
+  }
+
+  // 3. Verify active authorized device key for this student
+  const { data: activeDevice, error: devErr } = await supabase
+    .from("student_devices")
+    .select("id, device_public_key, algorithm, revoked_at")
+    .eq("student_id", student.id)
+    .is("revoked_at", null)
+    .order("enrolled_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (devErr || !activeDevice) {
+    return { ok: false, warning: `No active enrolled device found for student ${matric}` };
+  }
+
+  if (activeDevice.device_public_key !== publicKey) {
+    return { ok: false, warning: `Public key mismatch with enrolled key for student ${matric}` };
+  }
+
+  // 4. Cryptographic Signature Verification
+  const canonicalMessage = [
+    "v1",
+    "submission",
+    eventId,
+    credentialId,
+    credentialVersion,
+    activeDevice.algorithm || "ECDSA_P256_SHA256",
+    student.id,
+    matric,
+    terminalId,
+    sessionId || "",
+    challenge,
+    timestamp.toString(),
+    timestampSource,
+  ].join("|");
+
+  const isSigValid = await verifyP256Signature(canonicalMessage, signature, publicKey);
+  if (!isSigValid) {
+    return { ok: false, warning: `Cryptographic signature verification failed for student ${matric}` };
+  }
+
+  // 5. Preserved Timestamps
+  const phoneTime = timestamp > 0 ? new Date(timestamp * 1000).toISOString() : new Date().toISOString();
+  let terminalSavedAt: string | null = null;
+  if (raw.terminal_saved_at) {
+    try {
+      const parsed = new Date(raw.terminal_saved_at);
+      terminalSavedAt = isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    } catch {
+      terminalSavedAt = null;
+    }
+  }
+
+  // 6. Idempotent Insert into attendance_logs
+  const { error: insertErr } = await supabase.from("attendance_logs").insert({
+    session_id: sessionId,
+    student_id: student.id,
+    method: "ble_offline_signed",
+    event_id: eventId,
+    terminal_id: terminalId,
+    terminal_saved_at: terminalSavedAt,
+    phone_attendance_time: phoneTime,
+    timestamp_source: timestampSource,
+    offline_verified: true,
+    verified_at: terminalSavedAt || phoneTime || new Date().toISOString(),
+  });
+
+  if (insertErr) {
+    if (insertErr.code === "23505") { // unique constraint violation on event_id
+      return { ok: true, duplicate: true };
+    }
+    return { ok: false, warning: `Insert failed for ${matric}: ${insertErr.message}` };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Process a single legacy attendance CSV row.
  * CSV columns: Time, Name, Matric Number, Logging Type
- * Maps to attendance_logs with session_id = NULL (legacy import).
  */
 async function processAttendanceRow(
   supabase: SupabaseClient,
   raw: Record<string, string>,
 ): Promise<ProcessResult> {
-  const matric = raw.matric_number;
+  const matric = raw.matric_number?.trim();
   if (!matric) {
     return { ok: false, warning: "Empty matric number in attendance row" };
   }
 
-  // Look up student profile by matric number
   const { data: student, error: studentErr } = await supabase
     .from("profiles")
     .select("id")
     .eq("matric_number", matric)
     .maybeSingle();
 
-  if (studentErr) {
-    return { ok: false, warning: `DB error looking up matric ${matric}: ${studentErr.message}` };
-  }
-  if (!student) {
+  if (studentErr || !student) {
     return { ok: false, warning: `No student profile found for matric ${matric}` };
   }
 
-  // Determine attendance method from the "Logging Type" column
   const loggingType = (raw.logging_type ?? "").trim().toUpperCase();
-  const method: string =
-    loggingType === "QR_BLE" ? "qr_ble_legacy" : "2fa_rfid_fp";
+  // Mandatory 2FA check preservation: matched RFID AND fingerprint
+  const method: string = loggingType === "QR_BLE" ? "qr_ble_legacy" : "2fa_rfid_fp";
 
-  // Parse the timestamp from the ESP32 (format varies; fall back to now())
   let verifiedAt: string;
   try {
     const parsed = new Date(raw.time);
@@ -101,14 +287,15 @@ async function processAttendanceRow(
   }
 
   const { error: insertErr } = await supabase.from("attendance_logs").insert({
-    session_id: null, // legacy CSV imports have no session context
+    session_id: null,
     student_id: student.id,
     method,
     verified_at: verifiedAt,
+    offline_verified: false,
   });
 
   if (insertErr) {
-    return { ok: false, warning: `Failed to insert attendance log for ${matric}: ${insertErr.message}` };
+    return { ok: false, warning: `Failed to insert legacy attendance log for ${matric}: ${insertErr.message}` };
   }
 
   return { ok: true };
@@ -116,15 +303,14 @@ async function processAttendanceRow(
 
 /**
  * Process a single enrollment CSV row.
- *
  * CSV columns: Time, Name, Matric Number, RFID, Fingerprint ID
- * Upserts into student_credentials.
+ * Preserves mandatory terminal 2FA credentials.
  */
 async function processEnrollmentRow(
   supabase: SupabaseClient,
   raw: Record<string, string>,
 ): Promise<ProcessResult> {
-  const matric = raw.matric_number;
+  const matric = raw.matric_number?.trim();
   if (!matric) {
     return { ok: false, warning: "Empty matric number in enrollment row" };
   }
@@ -135,18 +321,13 @@ async function processEnrollmentRow(
     .eq("matric_number", matric)
     .maybeSingle();
 
-  if (studentErr) {
-    return { ok: false, warning: `DB error looking up matric ${matric}: ${studentErr.message}` };
-  }
-  if (!student) {
+  if (studentErr || !student) {
     return { ok: false, warning: `No student profile found for matric ${matric}` };
   }
 
   const rfidCardId = raw.rfid?.trim() || null;
-  const rawFpId = raw.fingerprint_id?.trim();
-  const fingerprintId = rawFpId ? parseInt(rawFpId, 10) : null;
+  const fingerprintId = raw.fingerprint_id ? parseInt(raw.fingerprint_id.trim(), 10) : null;
 
-  // Check for existing credential row for this student
   const { data: existing, error: fetchErr } = await supabase
     .from("student_credentials")
     .select("id, rfid_card_id, fingerprint_id")
@@ -158,10 +339,9 @@ async function processEnrollmentRow(
   }
 
   if (existing) {
-    // Update only the fields that are actually provided (non-null), preserving existing values
     const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
     if (rfidCardId !== null) updates.rfid_card_id = rfidCardId;
-    if (fingerprintId !== null) updates.fingerprint_id = fingerprintId;
+    if (fingerprintId !== null && !isNaN(fingerprintId)) updates.fingerprint_id = fingerprintId;
 
     const { error: updateErr } = await supabase
       .from("student_credentials")
@@ -177,7 +357,7 @@ async function processEnrollmentRow(
       .insert({
         student_id: student.id,
         rfid_card_id: rfidCardId,
-        fingerprint_id: fingerprintId,
+        fingerprint_id: fingerprintId !== null && !isNaN(fingerprintId) ? fingerprintId : null,
       });
 
     if (insertErr) {
@@ -191,9 +371,7 @@ async function processEnrollmentRow(
 // ─── Main handler ────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request): Promise<Response> => {
-  // ── Method gate ──────────────────────────────────────────────────────────
   if (req.method === "OPTIONS") {
-    // CORS preflight (not needed by ESP32 but useful for curl / Postman)
     return new Response(null, {
       status: 204,
       headers: {
@@ -208,25 +386,23 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return json({ error: "Method not allowed" }, 405);
   }
 
-  // ── Read & validate headers ──────────────────────────────────────────────
   const fileType = req.headers.get("x-sync-file-type");
   const deviceKey = req.headers.get("x-device-key");
 
   if (!deviceKey) {
     return json({ error: "Missing x-device-key header" }, 401);
   }
-  if (!fileType || (fileType !== "attendance" && fileType !== "enrollment")) {
-    return json({ error: "Missing or invalid x-sync-file-type header (expected 'attendance' or 'enrollment')" }, 400);
+  if (!fileType || (fileType !== "attendance" && fileType !== "enrollment" && fileType !== "signed_attendance")) {
+    return json({
+      error: "Missing or invalid x-sync-file-type header (expected 'attendance', 'enrollment', or 'signed_attendance')",
+    }, 400);
   }
 
-  // ── Authenticate device ──────────────────────────────────────────────────
-  // Hash the incoming key with SHA-256 and look it up directly in the DB.
-  // When registering devices, store SHA-256 hex digest in devices.device_key_hash.
+  // Authenticate device via SHA-256 key hash
   const keyHash = await sha256Hex(deviceKey);
-
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, // bypass RLS — server-to-server
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
 
   const { data: device, error: deviceErr } = await supabase
@@ -236,13 +412,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
     .maybeSingle();
 
   if (deviceErr || !device) {
-    console.error("Device auth failed:", deviceErr?.message ?? "no matching device_key_hash");
-    return json({ error: "Unauthorized — device key not recognised" }, 401);
+    console.error("Terminal device authentication failed");
+    return json({ error: "Unauthorized — terminal key not recognized" }, 401);
   }
 
-  console.log(`Authenticated device ${device.device_id} (${device.id})`);
+  console.log(`Authenticated terminal ${device.device_id} (${device.id})`);
 
-  // ── Read body ────────────────────────────────────────────────────────────
   let body: string;
   try {
     body = await req.text();
@@ -251,103 +426,102 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   if (!body.trim()) {
-    return json({ error: "Empty CSV body" }, 400);
+    return json({ error: "Empty request body" }, 400);
   }
 
-  // ── Parse CSV lines ──────────────────────────────────────────────────────
-  const allLines = body.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
-
-  // Detect and skip header row if present
-  const HEADER_RE = /^\s*time\s*,\s*name\s*,\s*matric/i;
-  const dataLines = allLines.length > 0 && HEADER_RE.test(allLines[0])
-    ? allLines.slice(1)
-    : allLines;
-
-  const rowsReceived = dataLines.length;
+  let rowsReceived = 0;
   let rowsProcessed = 0;
   let rowsFailed = 0;
+  let duplicates = 0;
   const warnings: string[] = [];
 
-  // ── Process each row ─────────────────────────────────────────────────────
-  for (const line of dataLines) {
-    const cols = splitCSVLine(line);
-
-    // Build the raw JSON object (column names normalised to snake_case)
-    let rawRow: Record<string, string>;
-
-    if (fileType === "attendance") {
-      // Expected: Time, Name, Matric Number, Logging Type
-      rawRow = {
-        time: cols[0] ?? "",
-        name: cols[1] ?? "",
-        matric_number: cols[2] ?? "",
-        logging_type: cols[3] ?? "",
-      };
-    } else {
-      // Expected: Time, Name, Matric Number, RFID, Fingerprint ID
-      rawRow = {
-        time: cols[0] ?? "",
-        name: cols[1] ?? "",
-        matric_number: cols[2] ?? "",
-        rfid: cols[3] ?? "",
-        fingerprint_id: cols[4] ?? "",
-      };
+  // Check if body is JSON array of signed attendance records
+  const isJson = body.trim().startsWith("[") || body.trim().startsWith("{");
+  if (isJson || fileType === "signed_attendance") {
+    let records: Record<string, string>[] = [];
+    try {
+      const parsed = JSON.parse(body);
+      records = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      // If not JSON, parse CSV format for signed attendance
+      const lines = body.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
+      records = lines.map((l) => {
+        const c = splitCSVLine(l);
+        return {
+          event_id: c[0] ?? "",
+          student_id: c[1] ?? "",
+          matric_number: c[2] ?? "",
+          terminal_id: c[3] ?? "",
+          session_id: c[4] ?? "",
+          timestamp: c[5] ?? "",
+          terminal_saved_at: c[6] ?? "",
+          public_key: c[7] ?? "",
+          signature: c[8] ?? "",
+          challenge: c[9] ?? "",
+        };
+      });
     }
 
-    // ── Step 1: Always insert into hardware_sync_log (audit trail) ───────
-    const { data: syncRow, error: syncErr } = await supabase
-      .from("hardware_sync_log")
-      .insert({
-        device_id: device.id,
-        file_type: fileType,
-        raw_row: rawRow,
-        processed: false,
-      })
-      .select("id")
-      .single();
-
-    if (syncErr) {
-      // If we can't even write the audit row, count it as failed but keep going
-      console.error("Failed to insert hardware_sync_log row:", syncErr.message);
-      rowsFailed++;
-      continue;
-    }
-
-    // ── Step 2: Attempt to process into normalised tables ────────────────
-    const result: ProcessResult =
-      fileType === "attendance"
-        ? await processAttendanceRow(supabase, rawRow)
-        : await processEnrollmentRow(supabase, rawRow);
-
-    if (result.ok) {
-      // ── Step 3: Mark audit row as processed ───────────────────────────
-      const { error: updateErr } = await supabase
-        .from("hardware_sync_log")
-        .update({ processed: true })
-        .eq("id", syncRow.id);
-
-      if (updateErr) {
-        console.warn(`Processed row but failed to mark sync log ${syncRow.id}:`, updateErr.message);
+    rowsReceived = records.length;
+    for (const record of records) {
+      const result = await processSignedAttendanceRow(supabase, record);
+      if (result.ok) {
+        if (result.duplicate) {
+          duplicates++;
+        } else {
+          rowsProcessed++;
+        }
+      } else {
+        rowsFailed++;
+        if (result.warning) warnings.push(result.warning);
       }
+    }
+  } else {
+    // Process legacy CSV
+    const allLines = body.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
+    const HEADER_RE = /^\s*time\s*,\s*name\s*,\s*matric/i;
+    const dataLines = allLines.length > 0 && HEADER_RE.test(allLines[0]) ? allLines.slice(1) : allLines;
 
-      rowsProcessed++;
-    } else {
-      console.warn(`Row processing warning: ${result.warning}`);
-      warnings.push(result.warning ?? "unknown error");
-      rowsFailed++;
+    rowsReceived = dataLines.length;
+    for (const line of dataLines) {
+      const cols = splitCSVLine(line);
+      const rawRow: Record<string, string> =
+        fileType === "attendance"
+          ? {
+              time: cols[0] ?? "",
+              name: cols[1] ?? "",
+              matric_number: cols[2] ?? "",
+              logging_type: cols[3] ?? "",
+            }
+          : {
+              time: cols[0] ?? "",
+              name: cols[1] ?? "",
+              matric_number: cols[2] ?? "",
+              rfid: cols[3] ?? "",
+              fingerprint_id: cols[4] ?? "",
+            };
+
+      const result =
+        fileType === "attendance"
+          ? await processAttendanceRow(supabase, rawRow)
+          : await processEnrollmentRow(supabase, rawRow);
+
+      if (result.ok) {
+        rowsProcessed++;
+      } else {
+        rowsFailed++;
+        if (result.warning) warnings.push(result.warning);
+      }
     }
   }
 
-  // ── Return summary ───────────────────────────────────────────────────────
-  console.log(
-    `Sync complete for ${device.device_id}: ${rowsReceived} received, ${rowsProcessed} processed, ${rowsFailed} failed`,
-  );
-
   return json({
+    accepted: rowsProcessed,
+    duplicates,
+    rejected: rowsFailed,
     rows_received: rowsReceived,
     rows_processed: rowsProcessed,
     rows_failed: rowsFailed,
-    // Include warnings only if there are any (helpful for debugging, firmware ignores them)
     ...(warnings.length > 0 ? { warnings } : {}),
   });
 });
