@@ -198,8 +198,9 @@ export interface ProcessResult {
 async function processSignedAttendanceRow(
   supabase: SupabaseClient,
   raw: Record<string, string>,
-  uploadingTerminalId: string,
+  uploadingTerminal: { id: string; device_id: string; public_key?: string | null; algorithm?: string },
 ): Promise<ProcessResult> {
+  const uploadingTerminalId = uploadingTerminal.device_id;
   const eventId = raw.event_id?.trim();
   const matric = raw.matric_number?.trim();
   const terminalId = raw.terminal_id?.trim() || "TERM_OFFLINE";
@@ -321,32 +322,7 @@ async function processSignedAttendanceRow(
     };
   }
 
-  // Policy: Handle delayed records from a subsequently revoked device
-  // Do NOT invent a precise pre-revocation attendance time from a provisional phone timestamp
-  if (matchedDevice.revoked_at) {
-    if (timestampSource === "phone_os" || !raw.terminal_saved_at) {
-      return {
-        ok: false,
-        status: "REJECTED",
-        event_id: eventId,
-        matric_number: matric,
-        reason: "DEVICE_REVOKED_PRIOR_TO_SYNC: Device revoked before upload; provisional phone time cannot be trusted without authoritative terminal timestamp",
-      };
-    }
-    const termTime = new Date(raw.terminal_saved_at).getTime();
-    const revokedTime = new Date(matchedDevice.revoked_at).getTime();
-    if (isNaN(termTime) || termTime >= revokedTime) {
-      return {
-        ok: false,
-        status: "REJECTED",
-        event_id: eventId,
-        matric_number: matric,
-        reason: "DEVICE_REVOKED_BEFORE_RECORDING: Terminal saved timestamp indicates check-in occurred after revocation",
-      };
-    }
-  }
-
-  // 4. Cryptographic Signature Verification
+  // 4. Student Cryptographic Signature Verification
   const canonicalMessage = [
     "v1",
     "submission",
@@ -372,6 +348,59 @@ async function processSignedAttendanceRow(
       matric_number: matric,
       reason: `INVALID_SIGNATURE: Cryptographic signature verification failed for student ${matric}`,
     };
+  }
+
+  // Compute canonical submission digest for receipt binding
+  const submissionDigest = await sha256Hex(canonicalMessage);
+
+  // 5. Terminal Receipt Cryptographic Verification (if terminal_saved_at provided)
+  const termReceiptSig = raw.terminal_receipt_signature?.trim();
+  let isTerminalReceiptVerified = false;
+
+  if (termReceiptSig && uploadingTerminal.public_key && raw.terminal_saved_at) {
+    const canonicalReceipt = [
+      "v1",
+      "receipt",
+      eventId,
+      terminalId,
+      sessionId || "",
+      submissionDigest,
+      "DURABLY_SAVED",
+      "true",
+      raw.record_index?.trim() || "",
+      raw.terminal_saved_at.trim(),
+    ].join("|");
+
+    isTerminalReceiptVerified = await verifyP256Signature(
+      canonicalReceipt,
+      termReceiptSig,
+      uploadingTerminal.public_key,
+    );
+  }
+
+  // 6. Policy: Handle delayed records from a subsequently revoked device
+  // Do NOT accept an unauthenticated terminal_saved_at as proof of pre-revocation attendance
+  if (matchedDevice.revoked_at) {
+    if (timestampSource === "phone_os" || !raw.terminal_saved_at || !isTerminalReceiptVerified) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: "DEVICE_REVOKED_PRIOR_TO_SYNC: Device revoked before upload; provisional phone time cannot be trusted without cryptographically verified terminal receipt signature",
+      };
+    }
+    const termTime = new Date(raw.terminal_saved_at).getTime();
+    const revokedTime = new Date(matchedDevice.revoked_at).getTime();
+    if (isNaN(termTime) || termTime >= revokedTime) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: "DEVICE_REVOKED_BEFORE_RECORDING: Authenticated terminal timestamp indicates check-in occurred after device revocation",
+      };
+    }
   }
 
   // 5. Preserved Timestamps
@@ -577,7 +606,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
 
   const { data: device, error: deviceErr } = await supabase
     .from("devices")
-    .select("id, device_id")
+    .select("id, device_id, public_key, algorithm, is_active")
     .eq("device_key_hash", keyHash)
     .maybeSingle();
 
@@ -586,7 +615,44 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return json({ error: "Unauthorized — terminal key not recognized" }, 401);
   }
 
+  if (device.is_active === false) {
+    console.error("Terminal device is inactive");
+    return json({ error: "Forbidden — terminal device is deactivated" }, 403);
+  }
+
   console.log(`Authenticated terminal ${device.device_id} (${device.id})`);
+
+  const syncAction = req.headers.get("x-sync-action")?.trim().toLowerCase();
+
+  // Provisioning helper: Fetch active student credentials for offline terminal caching
+  const fetchEnrolledKeys = async () => {
+    const { data: activeStudentDevices } = await supabase
+      .from("student_devices")
+      .select("student_id, device_public_key, credential_id, algorithm, profiles!inner(matric_number, full_name)")
+      .is("revoked_at", null);
+
+    return (activeStudentDevices || []).map((d: any) => ({
+      student_id: d.student_id,
+      matric_number: d.profiles?.matric_number || "",
+      public_key: d.device_public_key,
+      credential_id: d.credential_id,
+      algorithm: d.algorithm || "ECDSA_P256_SHA256",
+    }));
+  };
+
+  // Dedicated credential refresh path before attendance records exist
+  if (syncAction === "refresh_credentials") {
+    const enrolledKeys = await fetchEnrolledKeys();
+    return json({
+      accepted: 0,
+      duplicates: 0,
+      rejected: 0,
+      retryable: 0,
+      rows_received: 0,
+      records: [],
+      enrolled_keys: enrolledKeys,
+    });
+  }
 
   let body: string;
   try {
@@ -596,7 +662,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   if (!body.trim()) {
-    return json({ error: "Empty request body" }, 400);
+    // If empty body sent, refresh credentials cleanly rather than returning 400
+    const enrolledKeys = await fetchEnrolledKeys();
+    return json({
+      accepted: 0,
+      duplicates: 0,
+      rejected: 0,
+      retryable: 0,
+      rows_received: 0,
+      records: [],
+      enrolled_keys: enrolledKeys,
+    });
   }
 
   let rowsReceived = 0;
@@ -629,13 +705,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
           public_key: c[7] ?? "",
           signature: c[8] ?? "",
           challenge: c[9] ?? "",
+          timestamp_source: c[10] ?? "phone_os",
+          credential_id: c[11] ?? "",
+          credential_version: c[12] ?? "v1",
+          algorithm: c[13] ?? "ECDSA_P256_SHA256",
+          submission_digest: c[14] ?? "",
+          terminal_receipt_signature: c[15] ?? "",
         };
       });
     }
 
     rowsReceived = records.length;
     for (const record of records) {
-      const result = await processSignedAttendanceRow(supabase, record, device.device_id);
+      const result = await processSignedAttendanceRow(supabase, record, device);
       if (result.status === "ACCEPTED") rowsAccepted++;
       else if (result.status === "DUPLICATE") rowsDuplicates++;
       else if (result.status === "RETRYABLE") rowsRetryable++;
@@ -692,18 +774,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   // Provisioning: Fetch authorized active student credentials for offline terminal caching
-  const { data: activeStudentDevices } = await supabase
-    .from("student_devices")
-    .select("student_id, device_public_key, credential_id, algorithm, profiles!inner(matric_number, full_name)")
-    .is("revoked_at", null);
-
-  const enrolledKeys = (activeStudentDevices || []).map((d: any) => ({
-    student_id: d.student_id,
-    matric_number: d.profiles?.matric_number || "",
-    public_key: d.device_public_key,
-    credential_id: d.credential_id,
-    algorithm: d.algorithm || "ECDSA_P256_SHA256",
-  }));
+  const enrolledKeys = await fetchEnrolledKeys();
 
   return json({
     accepted: rowsAccepted,
