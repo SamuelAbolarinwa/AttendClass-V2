@@ -3,9 +3,11 @@
  *
  * Secure upload endpoint for attendance terminals (ESP32).
  * Supports:
- *   1. Cryptographically verified offline signed BLE attendance records.
- *   2. Legacy attendance CSV imports.
- *   3. Legacy enrollment CSV imports (mandatory RFID AND Fingerprint 2FA).
+ *   1. Cryptographically verified offline signed BLE attendance records with per-record outcomes.
+ *   2. Active student credential registry sync for offline terminals.
+ *   3. Delayed records from subsequently revoked devices evaluation policy.
+ *   4. Legacy attendance CSV imports.
+ *   5. Legacy enrollment CSV imports (mandatory RFID AND Fingerprint 2FA).
  *
  * AUTHENTICATION:
  *   x-device-key: static per-device secret (hashed with SHA-256 and matched against devices.device_key_hash)
@@ -178,16 +180,20 @@ function json(body: Record<string, unknown>, status = 200): Response {
 
 // ─── Row Processors ──────────────────────────────────────────────────────────
 
-interface ProcessResult {
+export type RecordStatus = "ACCEPTED" | "DUPLICATE" | "REJECTED" | "RETRYABLE";
+
+export interface ProcessResult {
   ok: boolean;
-  duplicate?: boolean;
-  warning?: string;
+  status: RecordStatus;
+  event_id?: string;
+  matric_number?: string;
+  reason?: string;
 }
 
 /**
  * Process a cryptographically signed offline attendance record.
  * Validates terminal identity, student profile, active device enrolment,
- * canonical signature, and idempotency by event_id.
+ * canonical signature, delayed revoked device policy, and idempotency by event_id.
  */
 async function processSignedAttendanceRow(
   supabase: SupabaseClient,
@@ -207,20 +213,23 @@ async function processSignedAttendanceRow(
   const timestampSource = raw.timestamp_source?.trim() || "phone_os";
 
   if (!eventId) {
-    return { ok: false, warning: "Missing event_id in signed attendance record" };
+    return { ok: false, status: "REJECTED", reason: "Missing event_id in signed attendance record" };
   }
   if (!matric) {
-    return { ok: false, warning: "Missing matric_number in signed attendance record" };
+    return { ok: false, status: "REJECTED", event_id: eventId, reason: "Missing matric_number in signed attendance record" };
   }
   if (!signature || !publicKey) {
-    return { ok: false, warning: `Missing signature or public_key for ${matric}` };
+    return { ok: false, status: "REJECTED", event_id: eventId, matric_number: matric, reason: `Missing signature or public_key for ${matric}` };
   }
 
   // 0. Terminal Matching: uploading terminal must match the record’s terminal_id
   if (terminalId !== uploadingTerminalId) {
     return {
       ok: false,
-      warning: `TERMINAL_MISMATCH: Record terminal ${terminalId} does not match uploading terminal ${uploadingTerminalId}`,
+      status: "REJECTED",
+      event_id: eventId,
+      matric_number: matric,
+      reason: `TERMINAL_MISMATCH: Record terminal ${terminalId} does not match uploading terminal ${uploadingTerminalId}`,
     };
   }
 
@@ -228,16 +237,26 @@ async function processSignedAttendanceRow(
   const fieldsToValidate = [eventId, credentialId, credentialVersion, matric, terminalId, sessionId || "", challenge, timestampSource];
   for (const f of fieldsToValidate) {
     if (f.includes("|") || f.includes("\n") || f.includes("\r")) {
-      return { ok: false, warning: "INVALID_DELIMITER: Canonical field cannot contain pipe or newline characters" };
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: "INVALID_DELIMITER: Canonical field cannot contain pipe or newline characters",
+      };
     }
   }
 
   // 1. Idempotency & Conflict Check: detect conflicting duplicate event_id
-  const { data: existingLog } = await supabase
+  const { data: existingLog, error: existErr } = await supabase
     .from("attendance_logs")
-    .select("id, student_id, terminal_id, method")
+    .select("id, student_id, terminal_id, method, submission_digest")
     .eq("event_id", eventId)
     .maybeSingle();
+
+  if (existErr) {
+    return { ok: false, status: "RETRYABLE", event_id: eventId, matric_number: matric, reason: existErr.message };
+  }
 
   if (existingLog) {
     const { data: stdProfile } = await supabase
@@ -252,10 +271,13 @@ async function processSignedAttendanceRow(
     ) {
       return {
         ok: false,
-        warning: `EVENT_ID_CONFLICT: Duplicate event_id ${eventId} submitted with conflicting student or terminal data`,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `EVENT_ID_CONFLICT: Duplicate event_id ${eventId} submitted with conflicting student or terminal data`,
       };
     }
-    return { ok: true, duplicate: true };
+    return { ok: true, status: "DUPLICATE", event_id: eventId, matric_number: matric };
   }
 
   // 2. Look up student profile
@@ -266,25 +288,62 @@ async function processSignedAttendanceRow(
     .maybeSingle();
 
   if (studentErr || !student) {
-    return { ok: false, warning: `No student profile found for matric ${matric}` };
+    return {
+      ok: false,
+      status: "REJECTED",
+      event_id: eventId,
+      matric_number: matric,
+      reason: `No student profile found for matric ${matric}`,
+    };
   }
 
-  // 3. Verify active authorized device key for this student
-  const { data: activeDevice, error: devErr } = await supabase
+  // 3. Verify authorized device key for this student (check active vs revoked status)
+  const { data: matchedDevice, error: devErr } = await supabase
     .from("student_devices")
-    .select("id, device_public_key, algorithm, revoked_at")
+    .select("id, device_public_key, algorithm, enrolled_at, revoked_at")
     .eq("student_id", student.id)
-    .is("revoked_at", null)
+    .eq("device_public_key", publicKey)
     .order("enrolled_at", { ascending: false })
     .limit(1)
     .maybeSingle();
 
-  if (devErr || !activeDevice) {
-    return { ok: false, warning: `No active enrolled device found for student ${matric}` };
+  if (devErr) {
+    return { ok: false, status: "RETRYABLE", event_id: eventId, matric_number: matric, reason: devErr.message };
   }
 
-  if (activeDevice.device_public_key !== publicKey) {
-    return { ok: false, warning: `Public key mismatch with enrolled key for student ${matric}` };
+  if (!matchedDevice) {
+    return {
+      ok: false,
+      status: "REJECTED",
+      event_id: eventId,
+      matric_number: matric,
+      reason: `UNENROLLED_DEVICE_KEY: Key not enrolled for student ${matric}`,
+    };
+  }
+
+  // Policy: Handle delayed records from a subsequently revoked device
+  // Do NOT invent a precise pre-revocation attendance time from a provisional phone timestamp
+  if (matchedDevice.revoked_at) {
+    if (timestampSource === "phone_os" || !raw.terminal_saved_at) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: "DEVICE_REVOKED_PRIOR_TO_SYNC: Device revoked before upload; provisional phone time cannot be trusted without authoritative terminal timestamp",
+      };
+    }
+    const termTime = new Date(raw.terminal_saved_at).getTime();
+    const revokedTime = new Date(matchedDevice.revoked_at).getTime();
+    if (isNaN(termTime) || termTime >= revokedTime) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: "DEVICE_REVOKED_BEFORE_RECORDING: Terminal saved timestamp indicates check-in occurred after revocation",
+      };
+    }
   }
 
   // 4. Cryptographic Signature Verification
@@ -294,7 +353,7 @@ async function processSignedAttendanceRow(
     eventId,
     credentialId,
     credentialVersion,
-    activeDevice.algorithm || "ECDSA_P256_SHA256",
+    matchedDevice.algorithm || "ECDSA_P256_SHA256",
     student.id,
     matric,
     terminalId,
@@ -306,7 +365,13 @@ async function processSignedAttendanceRow(
 
   const isSigValid = await verifyP256Signature(canonicalMessage, signature, publicKey);
   if (!isSigValid) {
-    return { ok: false, warning: `Cryptographic signature verification failed for student ${matric}` };
+    return {
+      ok: false,
+      status: "REJECTED",
+      event_id: eventId,
+      matric_number: matric,
+      reason: `INVALID_SIGNATURE: Cryptographic signature verification failed for student ${matric}`,
+    };
   }
 
   // 5. Preserved Timestamps
@@ -337,12 +402,18 @@ async function processSignedAttendanceRow(
 
   if (insertErr) {
     if (insertErr.code === "23505") { // unique constraint violation on event_id
-      return { ok: true, duplicate: true };
+      return { ok: true, status: "DUPLICATE", event_id: eventId, matric_number: matric };
     }
-    return { ok: false, warning: `Insert failed for ${matric}: ${insertErr.message}` };
+    return {
+      ok: false,
+      status: "RETRYABLE",
+      event_id: eventId,
+      matric_number: matric,
+      reason: `Insert failed for ${matric}: ${insertErr.message}`,
+    };
   }
 
-  return { ok: true };
+  return { ok: true, status: "ACCEPTED", event_id: eventId, matric_number: matric };
 }
 
 /**
@@ -355,7 +426,7 @@ async function processAttendanceRow(
 ): Promise<ProcessResult> {
   const matric = raw.matric_number?.trim();
   if (!matric) {
-    return { ok: false, warning: "Empty matric number in attendance row" };
+    return { ok: false, status: "REJECTED", reason: "Empty matric number in attendance row" };
   }
 
   const { data: student, error: studentErr } = await supabase
@@ -365,7 +436,7 @@ async function processAttendanceRow(
     .maybeSingle();
 
   if (studentErr || !student) {
-    return { ok: false, warning: `No student profile found for matric ${matric}` };
+    return { ok: false, status: "REJECTED", matric_number: matric, reason: `No student profile found for matric ${matric}` };
   }
 
   const loggingType = (raw.logging_type ?? "").trim().toUpperCase();
@@ -389,10 +460,15 @@ async function processAttendanceRow(
   });
 
   if (insertErr) {
-    return { ok: false, warning: `Failed to insert legacy attendance log for ${matric}: ${insertErr.message}` };
+    return {
+      ok: false,
+      status: "RETRYABLE",
+      matric_number: matric,
+      reason: `Failed to insert legacy attendance log for ${matric}: ${insertErr.message}`,
+    };
   }
 
-  return { ok: true };
+  return { ok: true, status: "ACCEPTED", matric_number: matric };
 }
 
 /**
@@ -406,7 +482,7 @@ async function processEnrollmentRow(
 ): Promise<ProcessResult> {
   const matric = raw.matric_number?.trim();
   if (!matric) {
-    return { ok: false, warning: "Empty matric number in enrollment row" };
+    return { ok: false, status: "REJECTED", reason: "Empty matric number in enrollment row" };
   }
 
   const { data: student, error: studentErr } = await supabase
@@ -416,7 +492,7 @@ async function processEnrollmentRow(
     .maybeSingle();
 
   if (studentErr || !student) {
-    return { ok: false, warning: `No student profile found for matric ${matric}` };
+    return { ok: false, status: "REJECTED", matric_number: matric, reason: `No student profile found for matric ${matric}` };
   }
 
   const rfidCardId = raw.rfid?.trim() || null;
@@ -429,7 +505,7 @@ async function processEnrollmentRow(
     .maybeSingle();
 
   if (fetchErr) {
-    return { ok: false, warning: `DB error fetching credentials for ${matric}: ${fetchErr.message}` };
+    return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `DB error fetching credentials for ${matric}: ${fetchErr.message}` };
   }
 
   if (existing) {
@@ -443,7 +519,7 @@ async function processEnrollmentRow(
       .eq("id", existing.id);
 
     if (updateErr) {
-      return { ok: false, warning: `Failed to update credentials for ${matric}: ${updateErr.message}` };
+      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Failed to update credentials for ${matric}: ${updateErr.message}` };
     }
   } else {
     const { error: insertErr } = await supabase
@@ -455,11 +531,11 @@ async function processEnrollmentRow(
       });
 
     if (insertErr) {
-      return { ok: false, warning: `Failed to insert credentials for ${matric}: ${insertErr.message}` };
+      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Failed to insert credentials for ${matric}: ${insertErr.message}` };
     }
   }
 
-  return { ok: true };
+  return { ok: true, status: "ACCEPTED", matric_number: matric };
 }
 
 // ─── Main handler ────────────────────────────────────────────────────────────
@@ -524,10 +600,11 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   let rowsReceived = 0;
-  let rowsProcessed = 0;
-  let rowsFailed = 0;
-  let duplicates = 0;
-  const warnings: string[] = [];
+  let rowsAccepted = 0;
+  let rowsDuplicates = 0;
+  let rowsRejected = 0;
+  let rowsRetryable = 0;
+  const recordOutcomes: { event_id?: string; matric_number?: string; status: RecordStatus; reason?: string }[] = [];
 
   // Check if body is JSON array of signed attendance records
   const isJson = body.trim().startsWith("[") || body.trim().startsWith("{");
@@ -559,16 +636,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
     rowsReceived = records.length;
     for (const record of records) {
       const result = await processSignedAttendanceRow(supabase, record, device.device_id);
-      if (result.ok) {
-        if (result.duplicate) {
-          duplicates++;
-        } else {
-          rowsProcessed++;
-        }
-      } else {
-        rowsFailed++;
-        if (result.warning) warnings.push(result.warning);
-      }
+      if (result.status === "ACCEPTED") rowsAccepted++;
+      else if (result.status === "DUPLICATE") rowsDuplicates++;
+      else if (result.status === "RETRYABLE") rowsRetryable++;
+      else rowsRejected++;
+
+      recordOutcomes.push({
+        event_id: result.event_id || record.event_id,
+        matric_number: result.matric_number || record.matric_number,
+        status: result.status,
+        reason: result.reason,
+      });
     }
   } else {
     // Process legacy CSV
@@ -600,22 +678,40 @@ Deno.serve(async (req: Request): Promise<Response> => {
           ? await processAttendanceRow(supabase, rawRow)
           : await processEnrollmentRow(supabase, rawRow);
 
-      if (result.ok) {
-        rowsProcessed++;
-      } else {
-        rowsFailed++;
-        if (result.warning) warnings.push(result.warning);
-      }
+      if (result.status === "ACCEPTED") rowsAccepted++;
+      else if (result.status === "DUPLICATE") rowsDuplicates++;
+      else if (result.status === "RETRYABLE") rowsRetryable++;
+      else rowsRejected++;
+
+      recordOutcomes.push({
+        matric_number: result.matric_number || rawRow.matric_number,
+        status: result.status,
+        reason: result.reason,
+      });
     }
   }
 
+  // Provisioning: Fetch authorized active student credentials for offline terminal caching
+  const { data: activeStudentDevices } = await supabase
+    .from("student_devices")
+    .select("student_id, device_public_key, credential_id, algorithm, profiles!inner(matric_number, full_name)")
+    .is("revoked_at", null);
+
+  const enrolledKeys = (activeStudentDevices || []).map((d: any) => ({
+    student_id: d.student_id,
+    matric_number: d.profiles?.matric_number || "",
+    public_key: d.device_public_key,
+    credential_id: d.credential_id,
+    algorithm: d.algorithm || "ECDSA_P256_SHA256",
+  }));
+
   return json({
-    accepted: rowsProcessed,
-    duplicates,
-    rejected: rowsFailed,
+    accepted: rowsAccepted,
+    duplicates: rowsDuplicates,
+    rejected: rowsRejected,
+    retryable: rowsRetryable,
     rows_received: rowsReceived,
-    rows_processed: rowsProcessed,
-    rows_failed: rowsFailed,
-    ...(warnings.length > 0 ? { warnings } : {}),
+    records: recordOutcomes,
+    enrolled_keys: enrolledKeys,
   });
 });

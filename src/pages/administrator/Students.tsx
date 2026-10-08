@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { supabase } from "../../lib/supabase";
 import { useAuth } from "../../contexts/AuthContext";
 import { AddStudentModal } from "../../components/AddStudentModal";
+import { DeviceManagementModal, StudentDevice } from "../../components/DeviceManagementModal";
 
 interface Student {
   id: string;
@@ -14,29 +15,48 @@ interface Student {
 export function Students() {
   const { account } = useAuth();
   const [students, setStudents] = useState<Student[]>([]);
+  const [devicesMap, setDevicesMap] = useState<Record<string, StudentDevice>>({});
   const [loading, setLoading] = useState(true);
   const [modalOpen, setModalOpen] = useState(false);
-  const [resetResult, setResetResult] = useState<{name: string, password: string} | null>(null);
+  const [resetResult, setResetResult] = useState<{ name: string; password: string } | null>(null);
   const [studentToReset, setStudentToReset] = useState<Student | null>(null);
+  const [selectedStudentForDevice, setSelectedStudentForDevice] = useState<Student | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   const fetchStudents = async () => {
     setLoading(true);
-    const { data, error } = await supabase
-      .from("profiles")
-      .select("id, full_name, matric_number, must_change_password, created_at")
-      .eq("role", "user")
-      .order("full_name");
+    const [profilesRes, devicesRes] = await Promise.all([
+      supabase
+        .from("profiles")
+        .select("id, full_name, matric_number, must_change_password, created_at")
+        .eq("role", "user")
+        .order("full_name"),
+      supabase
+        .from("student_devices")
+        .select("id, student_id, device_name, platform, credential_id, algorithm, enrolled_at, revoked_at")
+        .is("revoked_at", null),
+    ]);
 
-    if (error) {
-      console.error("Failed to fetch members:", error.message);
+    if (profilesRes.error) {
+      console.error("Failed to fetch members:", profilesRes.error.message);
     } else {
-      setStudents(data ?? []);
+      setStudents(profilesRes.data ?? []);
     }
+
+    if (!devicesRes.error && devicesRes.data) {
+      const map: Record<string, StudentDevice> = {};
+      for (const d of devicesRes.data) {
+        map[d.student_id] = d as StudentDevice;
+      }
+      setDevicesMap(map);
+    }
+
     setLoading(false);
   };
 
-  useEffect(() => { fetchStudents(); }, []);
+  useEffect(() => {
+    fetchStudents();
+  }, []);
 
   const handleModalClose = (didAdd: boolean) => {
     setModalOpen(false);
@@ -54,11 +74,11 @@ export function Students() {
       const { data, error } = await supabase.rpc("platform_admin", {
         p_token: account.token,
         p_op: "resetPassword",
-        p_args: { account_id: student.id }
+        p_args: { account_id: student.id },
       });
 
       if (error) throw error;
-      
+
       const res = data as any;
       if (!res.ok) throw new Error(res.error || "Failed to reset password");
 
@@ -99,39 +119,60 @@ export function Students() {
                   <th>Name</th>
                   <th>Matric Number</th>
                   <th>Status</th>
+                  <th>Device</th>
                   <th>Added</th>
                   <th>Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {students.map((s) => (
-                  <tr key={s.id}>
-                    <td style={{ fontWeight: 500 }}>{s.full_name}</td>
-                    <td>
-                      <code style={{ fontSize: "var(--text-xs)", background: "var(--color-bg)", padding: "2px 6px", borderRadius: 4 }}>
-                        {s.matric_number ?? "—"}
-                      </code>
-                    </td>
-                    <td>
-                      {s.must_change_password ? (
-                        <span className="badge badge-warning">Pending Setup</span>
-                      ) : (
-                        <span className="badge badge-success">Active</span>
-                      )}
-                    </td>
-                    <td className="text-muted text-sm">
-                      {new Date(s.created_at).toLocaleDateString()}
-                    </td>
-                    <td>
-                      <button 
-                        className="btn btn-secondary btn-sm"
-                        onClick={() => handleResetPassword(s)}
-                      >
-                        Reset Password
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {students.map((s) => {
+                  const dev = devicesMap[s.id];
+                  return (
+                    <tr key={s.id}>
+                      <td style={{ fontWeight: 500 }}>{s.full_name}</td>
+                      <td>
+                        <code style={{ fontSize: "var(--text-xs)", background: "var(--color-bg)", padding: "2px 6px", borderRadius: 4 }}>
+                          {s.matric_number ?? "—"}
+                        </code>
+                      </td>
+                      <td>
+                        {s.must_change_password ? (
+                          <span className="badge badge-warning">Pending Setup</span>
+                        ) : (
+                          <span className="badge badge-success">Active</span>
+                        )}
+                      </td>
+                      <td>
+                        {dev ? (
+                          <span className="badge badge-success" title={dev.credential_id || ""}>
+                            {dev.device_name || "Enrolled"}
+                          </span>
+                        ) : (
+                          <span className="badge badge-neutral">No Device</span>
+                        )}
+                      </td>
+                      <td className="text-muted text-sm">
+                        {new Date(s.created_at).toLocaleDateString()}
+                      </td>
+                      <td>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => handleResetPassword(s)}
+                          >
+                            Reset Password
+                          </button>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => setSelectedStudentForDevice(s)}
+                          >
+                            Manage Device
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -139,6 +180,16 @@ export function Students() {
       </div>
 
       {modalOpen && <AddStudentModal onClose={handleModalClose} />}
+
+      {selectedStudentForDevice && (
+        <DeviceManagementModal
+          student={selectedStudentForDevice}
+          onClose={(didChange) => {
+            setSelectedStudentForDevice(null);
+            if (didChange) fetchStudents();
+          }}
+        />
+      )}
 
       {studentToReset && (
         <div className="modal-overlay">
@@ -153,11 +204,16 @@ export function Students() {
             </div>
             <div className="modal-footer">
               <button className="btn btn-secondary" onClick={() => setStudentToReset(null)}>Cancel</button>
-              <button className="btn btn-danger" onClick={() => {
-                const s = studentToReset;
-                setStudentToReset(null);
-                executeResetPassword(s);
-              }}>Reset Password</button>
+              <button
+                className="btn btn-danger"
+                onClick={() => {
+                  const s = studentToReset;
+                  setStudentToReset(null);
+                  executeResetPassword(s);
+                }}
+              >
+                Reset Password
+              </button>
             </div>
           </div>
         </div>
