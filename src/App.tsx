@@ -5,6 +5,7 @@ import { DashboardLayout } from "./layouts/DashboardLayout";
 import { Login } from "./pages/Login";
 import { ResetPassword } from "./pages/ResetPassword";
 import { Students } from "./pages/administrator/Students";
+import { DeviceManagement } from "./pages/administrator/DeviceManagement";
 
 import { EnrollFacePage } from "./pages/EnrollFace";
 
@@ -33,6 +34,7 @@ export function App() {
             }
           >
             <Route path="/administrator/students" element={<Students />} />
+            <Route path="/administrator/devices" element={<DeviceManagement />} />
             <Route path="/administrator/register" element={<Register />} />
             <Route path="/administrator/statistics" element={<Statistics />} />
             <Route path="/administrator/cancelled-days" element={<CancelledDays />} />

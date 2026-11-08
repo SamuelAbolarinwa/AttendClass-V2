@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "seed:aeic": "tsx scripts/seed-aeic-students.ts",
-    "test:interop": "tsx scripts/test-signature-interop.ts"
+    "test:interop": "tsx scripts/test-signature-interop.ts",
+    "test:offline": "tsx scripts/test-offline-system.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

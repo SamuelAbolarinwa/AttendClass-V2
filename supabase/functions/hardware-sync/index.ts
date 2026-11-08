@@ -1,24 +1,31 @@
 /**
  * hardware-sync — Supabase Edge Function
  *
- * Secure upload endpoint for attendance terminals (ESP32).
- * Supports:
- *   1. Cryptographically verified offline signed BLE attendance records with per-record outcomes.
- *   2. Active student credential registry sync for offline terminals.
- *   3. Delayed records from subsequently revoked devices evaluation policy.
- *   4. Legacy attendance CSV imports.
- *   5. Legacy enrollment CSV imports (mandatory RFID AND Fingerprint 2FA).
+ * Secure upload & sync endpoint for:
+ *   1. Physical ESP32 Terminals (direct WiFi upload via x-device-key).
+ *   2. Mobile Admin BLE Sync Bridge (course rep/admin phone via active admin_token).
+ *   3. Active student credential registry provisioning (refresh_credentials / get_enrolled_keys).
+ *   4. Legacy 2FA CSV imports (RFID + Fingerprint).
  *
  * AUTHENTICATION:
- *   x-device-key: static per-device secret (hashed with SHA-256 and matched against devices.device_key_hash)
- *   x-sync-file-type: "attendance" | "enrollment" | "signed_attendance"
+ *   Mode A (Hardware Direct):
+ *     - Header 'x-device-key': static secret matched against devices.device_key_hash (SHA-256)
+ *     - Header 'x-sync-file-type': "signed_attendance" | "attendance" | "enrollment"
+ *     - Header 'x-sync-action': "refresh_credentials" (optional)
+ *
+ *   Mode B (Mobile Admin BLE Bridge):
+ *     - JSON Body: { action: "sync_attendance_batch", admin_token: "<UUID>", terminal_id: "...", records: [...] }
+ *     - Authenticated via active_sessions (valid, unexpired, role in ('administrator', 'manager'))
+ *
+ *   Mode C (Admin Provisioning Download):
+ *     - JSON Body: { action: "get_enrolled_keys", admin_token: "<UUID>" }
  */
 
 import { createClient, SupabaseClient } from "jsr:@supabase/supabase-js@2";
 
 // ─── Cryptographic & Encoding Helpers ────────────────────────────────────────
 
-/** SHA-256 hex digest — used to compare x-device-key against devices.device_key_hash */
+/** SHA-256 hex digest */
 async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
   const hash = await crypto.subtle.digest("SHA-256", data);
@@ -53,7 +60,7 @@ function validateSpkiP256(pubKeyBytes: Uint8Array): boolean {
   return true;
 }
 
-/** Convert ASN.1 DER ECDSA signature into 64-byte raw (R || S) format for WebCrypto with low-S canonicality */
+/** Convert ASN.1 DER ECDSA signature into 64-byte raw (R || S) format with low-S canonicality */
 function derToCompactSignature(derBytes: Uint8Array): Uint8Array {
   if (derBytes.length === 64) {
     const sHex = Array.from(derBytes.subarray(32, 64)).map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -100,24 +107,6 @@ function derToCompactSignature(derBytes: Uint8Array): Uint8Array {
     }
   }
   return raw;
-}
-
-/** Convert 64-byte raw (R || S) signature into ASN.1 DER format */
-function compactToDerSignature(compactBytes: Uint8Array): Uint8Array {
-  if (compactBytes.length !== 64) {
-    throw new Error(`Expected 64-byte signature, got ${compactBytes.length}`);
-  }
-  function toIntegerDer(bytes: Uint8Array): number[] {
-    let start = 0;
-    while (start < bytes.length - 1 && bytes[start] === 0) start++;
-    const trimmed = Array.from(bytes.subarray(start));
-    if (trimmed[0] >= 0x80) trimmed.unshift(0x00);
-    return [0x02, trimmed.length, ...trimmed];
-  }
-  const rDer = toIntegerDer(compactBytes.subarray(0, 32));
-  const sDer = toIntegerDer(compactBytes.subarray(32, 64));
-  const body = [...rDer, ...sDer];
-  return new Uint8Array([0x30, body.length, ...body]);
 }
 
 /** Verify ECDSA P-256 SHA-256 signature against X.509 SPKI public key */
@@ -170,11 +159,17 @@ function splitCSVLine(line: string): string[] {
   return line.split(",").map(unquote);
 }
 
-/** Build a JSON response. */
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, x-sync-file-type, x-device-key, x-sync-action, authorization, apikey",
+};
+
+/** Build a JSON response with CORS headers. */
 function json(body: Record<string, unknown>, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { ...CORS_HEADERS, "Content-Type": "application/json" },
   });
 }
 
@@ -192,8 +187,7 @@ export interface ProcessResult {
 
 /**
  * Process a cryptographically signed offline attendance record.
- * Validates terminal identity, student profile, active device enrolment,
- * canonical signature, delayed revoked device policy, and idempotency by event_id.
+ * Handles both full records (direct from terminal) and bridge records (via mobile admin).
  */
 async function processSignedAttendanceRow(
   supabase: SupabaseClient,
@@ -203,7 +197,7 @@ async function processSignedAttendanceRow(
   const uploadingTerminalId = uploadingTerminal.device_id;
   const eventId = raw.event_id?.trim();
   const matric = raw.matric_number?.trim();
-  const terminalId = raw.terminal_id?.trim() || "TERM_OFFLINE";
+  const terminalId = raw.terminal_id?.trim() || uploadingTerminalId;
   const sessionId = raw.session_id?.trim() || null;
   const challenge = raw.challenge?.trim() || "";
   const signature = raw.signature?.trim();
@@ -212,6 +206,8 @@ async function processSignedAttendanceRow(
   const credentialVersion = raw.credential_version?.trim() || "v1";
   const timestamp = parseInt(raw.timestamp || "0", 10);
   const timestampSource = raw.timestamp_source?.trim() || "phone_os";
+  const submissionDigest = raw.submission_digest?.trim();
+  const termReceiptSig = raw.terminal_receipt_signature?.trim();
 
   if (!eventId) {
     return { ok: false, status: "REJECTED", reason: "Missing event_id in signed attendance record" };
@@ -219,11 +215,8 @@ async function processSignedAttendanceRow(
   if (!matric) {
     return { ok: false, status: "REJECTED", event_id: eventId, reason: "Missing matric_number in signed attendance record" };
   }
-  if (!signature || !publicKey) {
-    return { ok: false, status: "REJECTED", event_id: eventId, matric_number: matric, reason: `Missing signature or public_key for ${matric}` };
-  }
 
-  // 0. Terminal Matching: uploading terminal must match the record’s terminal_id
+  // 0. Terminal Matching: uploading terminal must match the record's terminal_id
   if (terminalId !== uploadingTerminalId) {
     return {
       ok: false,
@@ -234,21 +227,7 @@ async function processSignedAttendanceRow(
     };
   }
 
-  // Delimiter validation: security-sensitive fields must not contain pipe or newline
-  const fieldsToValidate = [eventId, credentialId, credentialVersion, matric, terminalId, sessionId || "", challenge, timestampSource];
-  for (const f of fieldsToValidate) {
-    if (f.includes("|") || f.includes("\n") || f.includes("\r")) {
-      return {
-        ok: false,
-        status: "REJECTED",
-        event_id: eventId,
-        matric_number: matric,
-        reason: "INVALID_DELIMITER: Canonical field cannot contain pipe or newline characters",
-      };
-    }
-  }
-
-  // 1. Idempotency & Conflict Check: detect conflicting duplicate event_id
+  // 1. Idempotency & Conflict Check: detect existing event_id
   const { data: existingLog, error: existErr } = await supabase
     .from("attendance_logs")
     .select("id, student_id, terminal_id, method, submission_digest")
@@ -298,73 +277,80 @@ async function processSignedAttendanceRow(
     };
   }
 
-  // 3. Verify authorized device key for this student (check active vs revoked status)
-  const { data: matchedDevice, error: devErr } = await supabase
-    .from("student_devices")
-    .select("id, device_public_key, algorithm, enrolled_at, revoked_at")
-    .eq("student_id", student.id)
-    .eq("device_public_key", publicKey)
-    .order("enrolled_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-
-  if (devErr) {
-    return { ok: false, status: "RETRYABLE", event_id: eventId, matric_number: matric, reason: devErr.message };
-  }
-
-  if (!matchedDevice) {
-    return {
-      ok: false,
-      status: "REJECTED",
-      event_id: eventId,
-      matric_number: matric,
-      reason: `UNENROLLED_DEVICE_KEY: Key not enrolled for student ${matric}`,
-    };
-  }
-
-  // 4. Student Cryptographic Signature Verification
-  const canonicalMessage = [
-    "v1",
-    "submission",
-    eventId,
-    credentialId,
-    credentialVersion,
-    matchedDevice.algorithm || "ECDSA_P256_SHA256",
-    student.id,
-    matric,
-    terminalId,
-    sessionId || "",
-    challenge,
-    timestamp.toString(),
-    timestampSource,
-  ].join("|");
-
-  const isSigValid = await verifyP256Signature(canonicalMessage, signature, publicKey);
-  if (!isSigValid) {
-    return {
-      ok: false,
-      status: "REJECTED",
-      event_id: eventId,
-      matric_number: matric,
-      reason: `INVALID_SIGNATURE: Cryptographic signature verification failed for student ${matric}`,
-    };
-  }
-
-  // Compute canonical submission digest for receipt binding
-  const submissionDigest = await sha256Hex(canonicalMessage);
-
-  // 5. Terminal Receipt Cryptographic Verification (if terminal_saved_at provided)
-  const termReceiptSig = raw.terminal_receipt_signature?.trim();
+  // 3. Cryptographic Verification
+  let isStudentSigVerified = false;
   let isTerminalReceiptVerified = false;
+  let matchedDevice: any = null;
 
+  // 3a. If student signature and public key are present, verify student signature
+  if (signature && publicKey) {
+    const { data: dev, error: devErr } = await supabase
+      .from("student_devices")
+      .select("id, device_public_key, algorithm, enrolled_at, revoked_at")
+      .eq("student_id", student.id)
+      .eq("device_public_key", publicKey)
+      .order("enrolled_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (devErr) {
+      return { ok: false, status: "RETRYABLE", event_id: eventId, matric_number: matric, reason: devErr.message };
+    }
+
+    if (!dev) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `UNENROLLED_DEVICE_KEY: Key not enrolled for student ${matric}`,
+      };
+    }
+    matchedDevice = dev;
+
+    const canonicalMessage = [
+      "v1",
+      "submission",
+      eventId,
+      credentialId,
+      credentialVersion,
+      matchedDevice.algorithm || "ECDSA_P256_SHA256",
+      student.id,
+      matric,
+      terminalId,
+      sessionId || "",
+      challenge,
+      timestamp.toString(),
+      timestampSource,
+    ].join("|");
+
+    isStudentSigVerified = await verifyP256Signature(canonicalMessage, signature, publicKey);
+    if (!isStudentSigVerified) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `INVALID_SIGNATURE: Student ECDSA P-256 signature verification failed for ${matric}`,
+      };
+    }
+  }
+
+  // 3b. If terminal receipt signature is present, verify against uploading terminal public key
   if (termReceiptSig && uploadingTerminal.public_key && raw.terminal_saved_at) {
+    const digestToVerify = submissionDigest || (signature && publicKey ? await sha256Hex([
+      "v1", "submission", eventId, credentialId, credentialVersion,
+      matchedDevice?.algorithm || "ECDSA_P256_SHA256", student.id, matric, terminalId,
+      sessionId || "", challenge, timestamp.toString(), timestampSource
+    ].join("|")) : "");
+
     const canonicalReceipt = [
       "v1",
       "receipt",
       eventId,
       terminalId,
       sessionId || "",
-      submissionDigest,
+      digestToVerify,
       "DURABLY_SAVED",
       "true",
       raw.record_index?.trim() || "",
@@ -376,18 +362,38 @@ async function processSignedAttendanceRow(
       termReceiptSig,
       uploadingTerminal.public_key,
     );
+
+    if (!isTerminalReceiptVerified && !isStudentSigVerified) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `INVALID_TERMINAL_RECEIPT: Terminal signature verification failed for receipt ${eventId}`,
+      };
+    }
   }
 
-  // 6. Policy: Handle delayed records from a subsequently revoked device
-  // Do NOT accept an unauthenticated terminal_saved_at as proof of pre-revocation attendance
-  if (matchedDevice.revoked_at) {
+  // At least one valid cryptographic signature required
+  if (!isStudentSigVerified && !isTerminalReceiptVerified) {
+    return {
+      ok: false,
+      status: "REJECTED",
+      event_id: eventId,
+      matric_number: matric,
+      reason: "MISSING_CRYPTOGRAPHIC_PROOF: Record lacks valid student signature or terminal receipt signature",
+    };
+  }
+
+  // 4. Policy: Delayed records from subsequently revoked devices
+  if (matchedDevice?.revoked_at) {
     if (timestampSource === "phone_os" || !raw.terminal_saved_at || !isTerminalReceiptVerified) {
       return {
         ok: false,
         status: "REJECTED",
         event_id: eventId,
         matric_number: matric,
-        reason: "DEVICE_REVOKED_PRIOR_TO_SYNC: Device revoked before upload; provisional phone time cannot be trusted without cryptographically verified terminal receipt signature",
+        reason: "DEVICE_REVOKED_PRIOR_TO_SYNC: Device revoked before upload; provisional phone time cannot be trusted without verified terminal receipt",
       };
     }
     const termTime = new Date(raw.terminal_saved_at).getTime();
@@ -403,7 +409,7 @@ async function processSignedAttendanceRow(
     }
   }
 
-  // 5. Preserved Timestamps
+  // 5. Timestamps
   const phoneTime = timestamp > 0 ? new Date(timestamp * 1000).toISOString() : new Date().toISOString();
   let terminalSavedAt: string | null = null;
   if (raw.terminal_saved_at) {
@@ -416,6 +422,7 @@ async function processSignedAttendanceRow(
   }
 
   // 6. Idempotent Insert into attendance_logs
+  const verifiedAt = terminalSavedAt || phoneTime || new Date().toISOString();
   const { error: insertErr } = await supabase.from("attendance_logs").insert({
     session_id: sessionId,
     student_id: student.id,
@@ -425,12 +432,14 @@ async function processSignedAttendanceRow(
     terminal_saved_at: terminalSavedAt,
     phone_attendance_time: phoneTime,
     timestamp_source: timestampSource,
+    terminal_receipt_sig: termReceiptSig || null,
+    submission_digest: submissionDigest || null,
     offline_verified: true,
-    verified_at: terminalSavedAt || phoneTime || new Date().toISOString(),
+    verified_at: verifiedAt,
   });
 
   if (insertErr) {
-    if (insertErr.code === "23505") { // unique constraint violation on event_id
+    if (insertErr.code === "23505") {
       return { ok: true, status: "DUPLICATE", event_id: eventId, matric_number: matric };
     }
     return {
@@ -469,7 +478,6 @@ async function processAttendanceRow(
   }
 
   const loggingType = (raw.logging_type ?? "").trim().toUpperCase();
-  // Mandatory 2FA check preservation: matched RFID AND fingerprint
   const method: string = loggingType === "QR_BLE" ? "qr_ble_legacy" : "2fa_rfid_fp";
 
   let verifiedAt: string;
@@ -503,7 +511,6 @@ async function processAttendanceRow(
 /**
  * Process a single enrollment CSV row.
  * CSV columns: Time, Name, Matric Number, RFID, Fingerprint ID
- * Preserves mandatory terminal 2FA credentials.
  */
 async function processEnrollmentRow(
   supabase: SupabaseClient,
@@ -534,7 +541,7 @@ async function processEnrollmentRow(
     .maybeSingle();
 
   if (fetchErr) {
-    return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `DB error fetching credentials for ${matric}: ${fetchErr.message}` };
+    return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `DB error: ${fetchErr.message}` };
   }
 
   if (existing) {
@@ -548,7 +555,7 @@ async function processEnrollmentRow(
       .eq("id", existing.id);
 
     if (updateErr) {
-      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Failed to update credentials for ${matric}: ${updateErr.message}` };
+      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Update failed: ${updateErr.message}` };
     }
   } else {
     const { error: insertErr } = await supabase
@@ -560,71 +567,30 @@ async function processEnrollmentRow(
       });
 
     if (insertErr) {
-      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Failed to insert credentials for ${matric}: ${insertErr.message}` };
+      return { ok: false, status: "RETRYABLE", matric_number: matric, reason: `Insert failed: ${insertErr.message}` };
     }
   }
 
   return { ok: true, status: "ACCEPTED", matric_number: matric };
 }
 
-// ─── Main handler ────────────────────────────────────────────────────────────
+// ─── Main Handler ────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request): Promise<Response> => {
   if (req.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "POST, OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, x-sync-file-type, x-device-key",
-      },
-    });
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
   if (req.method !== "POST") {
     return json({ error: "Method not allowed" }, 405);
   }
 
-  const fileType = req.headers.get("x-sync-file-type");
-  const deviceKey = req.headers.get("x-device-key");
-
-  if (!deviceKey) {
-    return json({ error: "Missing x-device-key header" }, 401);
-  }
-  if (!fileType || (fileType !== "attendance" && fileType !== "enrollment" && fileType !== "signed_attendance")) {
-    return json({
-      error: "Missing or invalid x-sync-file-type header (expected 'attendance', 'enrollment', or 'signed_attendance')",
-    }, 400);
-  }
-
-  // Authenticate device via SHA-256 key hash
-  const keyHash = await sha256Hex(deviceKey);
   const supabase = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
   );
 
-  const { data: device, error: deviceErr } = await supabase
-    .from("devices")
-    .select("id, device_id, public_key, algorithm, is_active")
-    .eq("device_key_hash", keyHash)
-    .maybeSingle();
-
-  if (deviceErr || !device) {
-    console.error("Terminal device authentication failed");
-    return json({ error: "Unauthorized — terminal key not recognized" }, 401);
-  }
-
-  if (device.is_active === false) {
-    console.error("Terminal device is inactive");
-    return json({ error: "Forbidden — terminal device is deactivated" }, 403);
-  }
-
-  console.log(`Authenticated terminal ${device.device_id} (${device.id})`);
-
-  const syncAction = req.headers.get("x-sync-action")?.trim().toLowerCase();
-
-  // Provisioning helper: Fetch active student credentials for offline terminal caching
+  // Helper to fetch enrolled keys for terminal provisioning
   const fetchEnrolledKeys = async () => {
     const { data: activeStudentDevices } = await supabase
       .from("student_devices")
@@ -640,29 +606,161 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }));
   };
 
-  // Dedicated credential refresh path before attendance records exist
-  if (syncAction === "refresh_credentials") {
-    const enrolledKeys = await fetchEnrolledKeys();
-    return json({
-      accepted: 0,
-      duplicates: 0,
-      rejected: 0,
-      retryable: 0,
-      rows_received: 0,
-      records: [],
-      enrolled_keys: enrolledKeys,
-    });
-  }
+  const deviceKey = req.headers.get("x-device-key");
+  const fileType = req.headers.get("x-sync-file-type");
+  const syncAction = req.headers.get("x-sync-action")?.trim().toLowerCase();
 
-  let body: string;
+  // Read request body
+  let rawBodyText = "";
+  let jsonBody: any = null;
   try {
-    body = await req.text();
+    rawBodyText = await req.text();
+    if (rawBodyText.trim().startsWith("{") || rawBodyText.trim().startsWith("[")) {
+      jsonBody = JSON.parse(rawBodyText);
+    }
   } catch {
-    return json({ error: "Failed to read request body" }, 400);
+    // If not JSON, rawBodyText remains
   }
 
-  if (!body.trim()) {
-    // If empty body sent, refresh credentials cleanly rather than returning 400
+  // ══════════════════════════════════════════════════════════════════════════
+  // BRANCH 1: Mobile Admin BLE Sync Bridge ({ action: 'sync_attendance_batch' })
+  // ══════════════════════════════════════════════════════════════════════════
+  if (jsonBody && (jsonBody.action === "sync_attendance_batch" || jsonBody.action === "get_enrolled_keys")) {
+    const adminToken = jsonBody.admin_token;
+    if (!adminToken) {
+      return json({ error: "Unauthorized: admin_token required for mobile admin sync bridge" }, 401);
+    }
+
+    // Verify admin/manager session
+    const { data: sess, error: sessErr } = await supabase
+      .from("active_sessions")
+      .select("account_id, expires_at")
+      .eq("token", adminToken)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+
+    if (sessErr || !sess) {
+      return json({ error: "Unauthorized: Invalid or expired admin session token" }, 401);
+    }
+
+    const { data: adminUser, error: adminErr } = await supabase
+      .from("profiles")
+      .select("id, role")
+      .eq("id", sess.account_id)
+      .maybeSingle();
+
+    if (adminErr || !adminUser || (adminUser.role !== "administrator" && adminUser.role !== "manager")) {
+      return json({ error: "Forbidden: Administrator or manager role required" }, 403);
+    }
+
+    // Action: get_enrolled_keys
+    if (jsonBody.action === "get_enrolled_keys") {
+      const keys = await fetchEnrolledKeys();
+      return json({ ok: true, enrolled_keys: keys });
+    }
+
+    // Action: sync_attendance_batch
+    const terminalId = jsonBody.terminal_id || "TERM-DEFAULT";
+    const { data: terminalDevice } = await supabase
+      .from("devices")
+      .select("id, device_id, public_key, algorithm, is_active")
+      .eq("device_id", terminalId)
+      .maybeSingle();
+
+    const effectiveTerminal = terminalDevice || {
+      id: "00000000-0000-0000-0000-000000000000",
+      device_id: terminalId,
+      public_key: null,
+      algorithm: "ECDSA_P256_SHA256",
+    };
+
+    const records = Array.isArray(jsonBody.records) ? jsonBody.records : [];
+    let rowsAccepted = 0;
+    let rowsDuplicates = 0;
+    let rowsRejected = 0;
+    let rowsRetryable = 0;
+    const recordOutcomes: any[] = [];
+
+    for (const r of records) {
+      const rowRecord: Record<string, string> = {
+        event_id: r.event_id || r.eventId || "",
+        student_id: r.student_id || r.studentId || "",
+        matric_number: r.matric_number || r.matricNumber || "",
+        terminal_id: r.terminal_id || r.terminalId || terminalId,
+        session_id: r.session_id || r.sessionId || "",
+        timestamp: String(r.timestamp || 0),
+        submission_digest: r.submission_digest || r.submissionDigest || "",
+        terminal_receipt_signature: r.terminal_receipt_signature || r.terminalReceiptSignature || "",
+        terminal_saved_at: r.terminal_saved_at || r.saved_at || r.savedAt || "",
+        public_key: r.public_key || r.publicKey || "",
+        signature: r.signature || "",
+        challenge: r.challenge || "",
+      };
+
+      const result = await processSignedAttendanceRow(supabase, rowRecord, effectiveTerminal);
+      if (result.status === "ACCEPTED") rowsAccepted++;
+      else if (result.status === "DUPLICATE") rowsDuplicates++;
+      else if (result.status === "RETRYABLE") rowsRetryable++;
+      else rowsRejected++;
+
+      recordOutcomes.push({
+        event_id: result.event_id || rowRecord.event_id,
+        matric_number: result.matric_number || rowRecord.matric_number,
+        status: result.status,
+        reason: result.reason,
+      });
+    }
+
+    // Update terminal last_sync_at if terminal exists in DB
+    if (terminalDevice) {
+      await supabase
+        .from("devices")
+        .update({ last_sync_at: new Date().toISOString() })
+        .eq("id", terminalDevice.id);
+    }
+
+    const enrolledKeys = await fetchEnrolledKeys();
+
+    return json({
+      ok: true,
+      accepted: rowsAccepted,
+      duplicate: rowsDuplicates,
+      duplicates: rowsDuplicates,
+      rejected: rowsRejected,
+      retryable: rowsRetryable,
+      rows_received: records.length,
+      records: recordOutcomes,
+      enrolled_keys: enrolledKeys,
+    });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // BRANCH 2: Direct Hardware Terminal Upload (via x-device-key)
+  // ══════════════════════════════════════════════════════════════════════════
+  if (!deviceKey) {
+    return json({
+      error: "Unauthorized: Missing authentication (expected x-device-key header or valid admin_token in body)",
+    }, 401);
+  }
+
+  // Authenticate terminal device via SHA-256 key hash
+  const keyHash = await sha256Hex(deviceKey);
+  const { data: device, error: deviceErr } = await supabase
+    .from("devices")
+    .select("id, device_id, public_key, algorithm, is_active")
+    .eq("device_key_hash", keyHash)
+    .maybeSingle();
+
+  if (deviceErr || !device) {
+    return json({ error: "Unauthorized — terminal key not recognized" }, 401);
+  }
+
+  if (device.is_active === false) {
+    return json({ error: "Forbidden — terminal device is deactivated" }, 403);
+  }
+
+  // Direct Terminal Action: Refresh Credentials
+  if (syncAction === "refresh_credentials" || !rawBodyText.trim()) {
     const enrolledKeys = await fetchEnrolledKeys();
     return json({
       accepted: 0,
@@ -673,6 +771,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
       records: [],
       enrolled_keys: enrolledKeys,
     });
+  }
+
+  if (!fileType || (fileType !== "attendance" && fileType !== "enrollment" && fileType !== "signed_attendance")) {
+    return json({
+      error: "Missing or invalid x-sync-file-type header (expected 'attendance', 'enrollment', or 'signed_attendance')",
+    }, 400);
   }
 
   let rowsReceived = 0;
@@ -680,18 +784,15 @@ Deno.serve(async (req: Request): Promise<Response> => {
   let rowsDuplicates = 0;
   let rowsRejected = 0;
   let rowsRetryable = 0;
-  const recordOutcomes: { event_id?: string; matric_number?: string; status: RecordStatus; reason?: string }[] = [];
+  const recordOutcomes: any[] = [];
 
-  // Check if body is JSON array of signed attendance records
-  const isJson = body.trim().startsWith("[") || body.trim().startsWith("{");
-  if (isJson || fileType === "signed_attendance") {
+  // Signed attendance records (JSON array or CSV)
+  if (jsonBody || fileType === "signed_attendance") {
     let records: Record<string, string>[] = [];
-    try {
-      const parsed = JSON.parse(body);
-      records = Array.isArray(parsed) ? parsed : [parsed];
-    } catch {
-      // If not JSON, parse CSV format for signed attendance
-      const lines = body.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
+    if (jsonBody) {
+      records = Array.isArray(jsonBody) ? jsonBody : [jsonBody];
+    } else {
+      const lines = rawBodyText.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
       records = lines.map((l) => {
         const c = splitCSVLine(l);
         return {
@@ -731,8 +832,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
       });
     }
   } else {
-    // Process legacy CSV
-    const allLines = body.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
+    // Legacy CSV processing
+    const allLines = rawBodyText.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
     const HEADER_RE = /^\s*time\s*,\s*name\s*,\s*matric/i;
     const dataLines = allLines.length > 0 && HEADER_RE.test(allLines[0]) ? allLines.slice(1) : allLines;
 
@@ -773,11 +874,17 @@ Deno.serve(async (req: Request): Promise<Response> => {
     }
   }
 
-  // Provisioning: Fetch authorized active student credentials for offline terminal caching
+  // Update terminal last_sync_at
+  await supabase
+    .from("devices")
+    .update({ last_sync_at: new Date().toISOString() })
+    .eq("id", device.id);
+
   const enrolledKeys = await fetchEnrolledKeys();
 
   return json({
     accepted: rowsAccepted,
+    duplicate: rowsDuplicates,
     duplicates: rowsDuplicates,
     rejected: rowsRejected,
     retryable: rowsRetryable,

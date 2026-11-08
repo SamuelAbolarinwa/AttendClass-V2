@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AttendanceSubmissionPayload",
+  "type": "object",
+  "required": [
+    "version",
+    "event_id",
+    "student_id",
+    "matric_number",
+    "terminal_id",
+    "challenge",
+    "timestamp",
+    "public_key",
+    "signature"
+  ],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "event_id": { "type": "string", "format": "uuid" },
+    "credential_id": { "type": "string" },
+    "credential_version": { "type": "string", "default": "v1" },
+    "algorithm": { "type": "string", "enum": ["ECDSA_P256_SHA256"] },
+    "student_id": { "type": "string", "format": "uuid" },
+    "matric_number": { "type": "string", "pattern": "^[0-9]{4}/[0-9]/[0-9]{5}[A-Z]{2}$" },
+    "terminal_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "challenge": { "type": "string", "minLength": 16 },
+    "timestamp": { "type": "integer", "minimum": 1767225600 },
+    "timestamp_source": { "type": "string", "enum": ["phone_os", "terminal_sync"] },
+    "public_key": {
+      "type": "string",
+      "minLength": 124,
+      "maxLength": 124,
+      "pattern": "^MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE"
+    },
+    "signature": { "type": "string", "minLength": 64 }
+  },
+  "additionalProperties": false
+}

@@ -56,6 +56,13 @@ export function DashboardLayout() {
                 👥 Members
               </NavLink>
               <NavLink
+                to="/administrator/devices"
+                onClick={() => setSidebarOpen(false)}
+                className={({ isActive }) => isActive ? "active" : ""}
+              >
+                📱 Devices & Terminals
+              </NavLink>
+              <NavLink
                 to="/administrator/cancelled-days"
                 onClick={() => setSidebarOpen(false)}
                 className={({ isActive }) => isActive ? "active" : ""}

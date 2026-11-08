@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AdminBleSyncBatchPayload",
+  "type": "object",
+  "required": [
+    "action",
+    "admin_token",
+    "terminal_id",
+    "records"
+  ],
+  "properties": {
+    "action": { "type": "string", "const": "sync_attendance_batch" },
+    "admin_token": { "type": "string", "format": "uuid" },
+    "terminal_id": { "type": "string" },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "matric_number",
+          "terminal_id",
+          "timestamp"
+        ],
+        "properties": {
+          "event_id": { "type": "string" },
+          "student_id": { "type": "string" },
+          "matric_number": { "type": "string" },
+          "terminal_id": { "type": "string" },
+          "session_id": { "type": ["string", "null"] },
+          "course_code": { "type": ["string", "null"] },
+          "timestamp": { "type": ["integer", "string"] },
+          "submission_digest": { "type": ["string", "null"] },
+          "terminal_receipt_signature": { "type": ["string", "null"] },
+          "terminal_saved_at": { "type": ["string", "null"] },
+          "public_key": { "type": ["string", "null"] },
+          "signature": { "type": ["string", "null"] },
+          "challenge": { "type": ["string", "null"] }
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

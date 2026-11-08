@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TerminalReceiptPayload",
+  "type": "object",
+  "required": [
+    "version",
+    "event_id",
+    "terminal_id",
+    "submission_digest",
+    "status",
+    "sd_persisted"
+  ],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "event_id": { "type": "string", "format": "uuid" },
+    "terminal_id": { "type": "string" },
+    "session_id": { "type": ["string", "null"] },
+    "submission_digest": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "status": { "type": "string", "enum": ["DURABLY_SAVED", "REJECTED"] },
+    "sd_persisted": { "type": "boolean" },
+    "record_index": { "type": ["integer", "null"] },
+    "saved_at": { "type": ["string", "null"] },
+    "signature": { "type": ["string", "null"] },
+    "error_code": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}
