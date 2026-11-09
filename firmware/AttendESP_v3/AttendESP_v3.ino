@@ -102,12 +102,24 @@
 #define BUZZER_PIN 16
 
 // ================= NETWORK & CLOUD CONFIGURATION =================
-const char* WIFI_SSID = "TECNO SPARK 40 Pro";
-const char* WIFI_PASSWORD = "12345678";
-const char* CLOUD_BASE_URL = "https://placeholder-project.supabase.co";
+#ifndef WIFI_SSID
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+#endif
+#ifndef WIFI_PASSWORD
+const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+#endif
+#ifndef CLOUD_BASE_URL
+const char* CLOUD_BASE_URL = "https://your-supabase-project.supabase.co";
+#endif
+#ifndef SYNC_ENDPOINT
 const char* SYNC_ENDPOINT = "/functions/v1/hardware-sync";
-const char* DEVICE_KEY = "TERM_LAB1_SHARED_SECRET";
+#endif
+#ifndef DEVICE_KEY
+const char* DEVICE_KEY = "YOUR_DEVICE_SECRET_KEY";
+#endif
+#ifndef DEVICE_ID
 const String DEVICE_ID = "TERM-LAB1-01";
+#endif
 
 // Master administrative RFID card UID
 const String MASTER_RFID_UID = "B3B7FE1A";
@@ -451,7 +463,9 @@ bool loadTerminalKeyFromSD() {
   xSemaphoreGive(sdMutex);
 
   // Import private scalar d
-  if (mbedtls_mpi_read_binary(&terminalKeyCtx.d, privScalar, 32) != 0) {
+  int privReadRet = mbedtls_mpi_read_binary(&terminalKeyCtx.d, privScalar, 32);
+  memset(privScalar, 0, sizeof(privScalar)); // Zeroize sensitive key bytes from stack
+  if (privReadRet != 0) {
     Serial.println("[SECURITY] Failed to load private key scalar.");
     terminalKeyValid = false;
     return false;

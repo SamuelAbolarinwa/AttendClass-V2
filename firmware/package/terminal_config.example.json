@@ -1,0 +1,9 @@
+{
+  "wifi_ssid": "CAMPUS_WIFI",
+  "wifi_password": "CAMPUS_PASSWORD",
+  "cloud_base_url": "https://your-supabase-project.supabase.co",
+  "sync_endpoint": "/functions/v1/hardware-sync",
+  "device_id": "TERM-LAB1-01",
+  "device_key": "TERM_LAB1_SHARED_SECRET",
+  "master_rfid_uid": "B3B7FE1A"
+}
