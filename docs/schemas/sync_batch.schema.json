@@ -35,7 +35,29 @@
           "terminal_saved_at": { "type": ["string", "null"] },
           "public_key": { "type": ["string", "null"] },
           "signature": { "type": ["string", "null"] },
-          "challenge": { "type": ["string", "null"] }
+          "challenge": { "type": ["string", "null"] },
+          "terminal_provenance_sig": { "type": ["string", "null"] },
+          "clock_source": {
+            "type": ["string", "null"],
+            "enum": ["ntp", "rtc", "provisional_phone", "unsynchronized", "unknown", null]
+          },
+          "phone_timestamp": { "type": ["string", "integer", "null"] },
+          "recorded_timestamp": { "type": ["string", "null"] },
+          "provenance_canonical": { "type": ["string", "null"] },
+          "provenance_statement": {
+            "type": ["object", "null"],
+            "properties": {
+              "version": { "type": "integer" },
+              "event_id": { "type": "string" },
+              "terminal_id": { "type": "string" },
+              "session_id": { "type": ["string", "null"] },
+              "recorded_timestamp": { "type": "string" },
+              "phone_timestamp": { "type": "string" },
+              "clock_source": { "type": "string" },
+              "submission_digest": { "type": "string" },
+              "signature": { "type": "string" }
+            }
+          }
         }
       }
     }

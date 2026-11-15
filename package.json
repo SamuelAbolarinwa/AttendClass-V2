@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "seed:aeic": "tsx scripts/seed-aeic-students.ts",
     "test:interop": "tsx scripts/test-signature-interop.ts",
-    "test:offline": "tsx scripts/test-offline-system.ts"
+    "test:offline": "tsx scripts/test-offline-system.ts",
+    "test:provenance": "tsx scripts/test-time-provenance.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

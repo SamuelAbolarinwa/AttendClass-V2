@@ -12,7 +12,7 @@
  * 8. SQL migration 0017 security audit & rollback consistency.
  */
 
-import { readFileSync } from "fs";
+import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 
 const SECP256R1_N = BigInt("0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
@@ -301,7 +301,9 @@ async function runTests() {
   // ── TEST 5: SQL Migration 0017 Security Audit ─────────────────────────────
   console.log("\n5. SQL Migration 0017 Security Audit & Rollback Verification:");
   const migrationSqlPath = join(__dirname, "..", "supabase", "migrations", "0017_device_enrolment_and_offline_attendance.sql");
-  const rollbackSqlPath = join(__dirname, "..", "supabase", "migrations", "0017_rollback.sql");
+  const rollbackInRollbackDir = join(__dirname, "..", "supabase", "rollback", "0017_rollback.sql");
+  const rollbackInMigrationsDir = join(__dirname, "..", "supabase", "migrations", "0017_rollback.sql");
+  const rollbackSqlPath = existsSync(rollbackInRollbackDir) ? rollbackInRollbackDir : rollbackInMigrationsDir;
 
   const migrationSql = readFileSync(migrationSqlPath, "utf-8");
   const rollbackSql = readFileSync(rollbackSqlPath, "utf-8");

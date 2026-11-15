@@ -151,7 +151,37 @@ Emitted by ESP32 ONLY after record is durably flushed to `/attendance_offline.cs
 v1|receipt|{event_id}|{terminal_id}|{session_id}|{submission_digest}|{status}|{sd_persisted}|{record_index}|{saved_at}
 ```
 
-### 4.5 Disconnect Reconciliation Query (0000ff12)
+### 4.6 Terminal Time-Provenance Statement (v2)
+Separate from the v1 receipt, the terminal can issue a cryptographically signed provenance statement that binds the recorded time source and student submission digest under the terminal's registered ECDSA P-256 private key:
+```json
+{
+  "version": 2,
+  "type": "provenance",
+  "event_id": "c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c",
+  "terminal_id": "TERM-LAB1-01",
+  "session_id": "sess_20261006",
+  "recorded_timestamp": "2026-10-08T09:30:00Z",
+  "phone_timestamp": "1791298800",
+  "clock_source": "ntp",
+  "submission_digest": "<SHA-256_Hex_of_Canonical_Submission>",
+  "signature": "<Terminal_P256_Signature_Base64>"
+}
+```
+**Canonical Message for Time-Provenance Signing**:
+```
+v2|provenance|{event_id}|{terminal_id}|{session_id}|{recorded_timestamp}|{phone_timestamp}|{clock_source}|{submission_digest}
+```
+
+> [!WARNING]
+> **Pilot Firmware Trust Boundary & Provisional Clock Fallback**:
+> The AttendESP v3 pilot firmware fallback writes provisional phone time when unsynchronized to NTP.
+> The backend:
+> 1. NEVER infers clock trust from unsigned BLE fields or student-asserted `timestamp_source=phone_os`.
+> 2. Sets unprovenanced 16-field CSV records to `time_source='unknown'` and `time_verification_status='pending_review'`.
+> 3. Detects clock skew exceeding 15 minutes (900 seconds) or future-dated phone timestamps, flagging them as `flagged_anomalous`.
+> 4. Strictly separates authoritative cloud ingest time (`server_received_at`) from terminal and phone timestamps.
+
+### 4.7 Disconnect Reconciliation Query (0000ff12)
 If connection drops during transmission, phone queries:
 ```
 v1|reconcile|{eventId}|{studentId}
@@ -222,9 +252,27 @@ Content-Type: application/json
 
 ## 6. ESP32 Provisioning Bundle Contract
 
-The offline ESP32 stores active keys in `/enrolled_keys.csv`:
+The offline ESP32 filesystem (MicroSD or SPIFFS) requires the following authoritative provisioning files:
+
+### 6.1 Terminal Configuration (`/terminal_config.json`)
+```json
+{
+  "terminal_id": "TERM-LAB1-01",
+  "name": "Main CS Lab 1",
+  "location": "Room 402, Block B",
+  "rssi_threshold_dbm": -75,
+  "sync_url": "https://<PROJECT-REF>.supabase.co/functions/v1/hardware-sync",
+  "device_key": "<SECRET-DEVICE-KEY>"
+}
+```
+
+### 6.2 Student Enrolled Credentials Registry (`/enrolled_keys.csv`)
+Downloaded directly from the Administrator Web Portal via the **📥 Download /enrolled_keys.csv** button or sync endpoint:
 ```csv
 matric,student_id,public_key,credential_id,algorithm,revoked
 2021/1/12345CP,std-uuid-001,MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...,cred-p256-01,ECDSA_P256_SHA256,false
 ```
 Terminals reject any check-in from a key not listed in `/enrolled_keys.csv` with `STUDENT_NOT_ENROLLED` or `UNAUTHORIZED_PUBLIC_KEY`.
+
+### 6.3 Terminal Hardware Key (`/terminal_key.bin` / Secure NVS)
+Stores the terminal's NIST P-256 private key used to sign challenge nonces, durable write receipts, and v2 time-provenance statements. The corresponding public key is registered in the cloud database under `devices.public_key`.

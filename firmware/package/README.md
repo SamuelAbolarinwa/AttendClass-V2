@@ -77,3 +77,4 @@ Install the following exact library versions via the Arduino Library Manager:
 4. Set Upload Speed: **921600** (or **115200** if unstable).
 5. Compile sketch to verify (Sketch -> Verify/Compile).
 6. Flash to device only when physical terminal upgrade is scheduled.
+

@@ -181,6 +181,30 @@ const SIGNATURE_INTEROP_VECTORS = [
       "3/stS8kb8afU9HwEkZoR2rqjEjMNVtvrzrWwl1xxdpQianjJUTZwADov84KAn2BmjPAoqRL6WmSh/aun6ckKDQ==",
     expectedValid: false,
   },
+  {
+    description: "Valid Terminal ECDSA P-256 signature over canonical v2 time-provenance statement",
+    canonicalMessage:
+      "v2|provenance|c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c|TERM_01|sess_20261006|2026-10-08T09:30:00Z|1791298800|ntp|a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    publicKeySpkiBase64:
+      "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/OCJ5dQYMGTsvU5574qtJFZLJW9/iZ+mJiGVl9tEckQlhjbWbuaAxdhClH1JuAC0pR6RxbB0qujJOZcZ9gV3NQ==",
+    asn1DerSignatureBase64:
+      "MEUCIQDvece8wlijwis9dZ2u84fopN9UcQ/0L98y2ww0DK5j/wIgBX7AM3YyXN6b6a6Sj/IF6t8uHuitHpf54QIRSkYAGAM=",
+    compactP1363SignatureBase64:
+      "73nHvMJYo8IrPXWdrvOH6KTfVHEP9C/fMtsMNAyuY/8FfsAzdjJc3pvprpKP8gXq3y4e6K0el/nhAhFKRgAYAw==",
+    expectedValid: true,
+  },
+  {
+    description: "Tampered canonical v2 time-provenance message must fail verification",
+    canonicalMessage:
+      "v2|provenance|c1f7b0a8-4e3d-4c8e-9d8a-6b2f4e8a1d2c|TERM_01|sess_20261006|2026-10-08T09:30:00Z|1791298800|provisional_phone|a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    publicKeySpkiBase64:
+      "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE/OCJ5dQYMGTsvU5574qtJFZLJW9/iZ+mJiGVl9tEckQlhjbWbuaAxdhClH1JuAC0pR6RxbB0qujJOZcZ9gV3NQ==",
+    asn1DerSignatureBase64:
+      "MEUCIQDvece8wlijwis9dZ2u84fopN9UcQ/0L98y2ww0DK5j/wIgBX7AM3YyXN6b6a6Sj/IF6t8uHuitHpf54QIRSkYAGAM=",
+    compactP1363SignatureBase64:
+      "73nHvMJYo8IrPXWdrvOH6KTfVHEP9C/fMtsMNAyuY/8FfsAzdjJc3pvprpKP8gXq3y4e6K0el/nhAhFKRgAYAw==",
+    expectedValid: false,
+  },
 ];
 
 async function run() {

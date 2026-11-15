@@ -48,14 +48,42 @@ interface AuditLog {
   created_at: string;
 }
 
+interface AttendanceReviewItem {
+  id: string;
+  event_id: string;
+  student_id: string;
+  student_name?: string;
+  matric_number?: string;
+  terminal_id: string;
+  terminal_name?: string;
+  session_id?: string;
+  terminal_saved_at: string | null;
+  phone_attendance_time: string | null;
+  server_received_at: string;
+  time_source: "ntp" | "rtc" | "provisional_phone" | "unsynchronized" | "unknown";
+  time_verification_status: "verified" | "pending_review" | "flagged_anomalous" | "rejected";
+  clock_skew_seconds: number | null;
+  reviewed_by?: string;
+  reviewer_name?: string;
+  reviewed_at?: string;
+  review_notes?: string;
+}
+
 export function DeviceManagement() {
   const { account } = useAuth();
-  const [activeTab, setActiveTab] = useState<"students" | "requests" | "terminals" | "audit">("students");
+  const [activeTab, setActiveTab] = useState<"students" | "requests" | "terminals" | "audit" | "time_reviews">("students");
   const [students, setStudents] = useState<Student[]>([]);
   const [devicesMap, setDevicesMap] = useState<Record<string, StudentDevice>>({});
   const [changeRequests, setChangeRequests] = useState<ChangeRequest[]>([]);
   const [terminals, setTerminals] = useState<TerminalDevice[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [reviewQueue, setReviewQueue] = useState<AttendanceReviewItem[]>([]);
+  const [reviewFilterStatus, setReviewFilterStatus] = useState<string>("all");
+  const [reviewSearchQuery, setReviewSearchQuery] = useState<string>("");
+  const [selectedRecordForReview, setSelectedRecordForReview] = useState<AttendanceReviewItem | null>(null);
+  const [reviewDecision, setReviewDecision] = useState<"verified" | "rejected" | "flagged_anomalous">("verified");
+  const [reviewNotes, setReviewNotes] = useState<string>("");
+  const [submittingReview, setSubmittingReview] = useState<boolean>(false);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterStatus, setFilterStatus] = useState<"all" | "enrolled" | "unenrolled">("all");
@@ -113,14 +141,24 @@ export function DeviceManagement() {
 
       setTerminals(terminalsRes.data ?? []);
 
-      // Fetch Audit Logs
+      // Fetch Audit Logs & Time Provenance Reviews
       if (account?.token) {
-        const { data: auditRes } = await supabase.rpc("platform_get_device_audit_log", {
-          p_admin_token: account.token,
-          p_limit: 100,
-        });
-        if (auditRes?.ok) {
-          setAuditLogs(auditRes.entries ?? []);
+        const [auditRes, revRes] = await Promise.all([
+          supabase.rpc("platform_get_device_audit_log", {
+            p_admin_token: account.token,
+            p_limit: 100,
+          }),
+          supabase.rpc("admin_get_pending_attendance_reviews", {
+            p_token: account.token,
+            p_status: "all",
+            p_limit: 100,
+          }),
+        ]);
+        if (auditRes.data?.ok) {
+          setAuditLogs(auditRes.data.entries ?? []);
+        }
+        if (revRes.data?.ok) {
+          setReviewQueue(revRes.data.records ?? []);
         }
       }
     } catch (err: unknown) {
@@ -133,6 +171,90 @@ export function DeviceManagement() {
   useEffect(() => {
     fetchData();
   }, []);
+
+  // Submit Review for an Attendance Record
+  const handleSubmitReview = async () => {
+    if (!account || !selectedRecordForReview) return;
+    setSubmittingReview(true);
+    setActionMsg(null);
+    try {
+      const { data, error } = await supabase.rpc("admin_review_attendance_record", {
+        p_token: account.token,
+        p_event_id: selectedRecordForReview.event_id,
+        p_decision: reviewDecision,
+        p_notes: reviewNotes.trim() || null,
+      });
+
+      if (error) throw error;
+      const res = data as any;
+      if (!res.ok) throw new Error(res.error || "Review submission failed");
+
+      setActionMsg({
+        text: `Updated attendance record (${selectedRecordForReview.matric_number}): Status changed to ${reviewDecision.replace("_", " ").toUpperCase()}.`,
+        type: "success",
+      });
+      setSelectedRecordForReview(null);
+      setReviewNotes("");
+      await fetchData();
+    } catch (err: unknown) {
+      setActionMsg({
+        text: err instanceof Error ? err.message : String(err),
+        type: "error",
+      });
+    } finally {
+      setSubmittingReview(false);
+    }
+  };
+
+  // Export Time Provenance Review Queue to CSV
+  const handleExportReviewQueueCSV = () => {
+    if (reviewQueue.length === 0) return;
+    const headers = [
+      "Event ID",
+      "Matric Number",
+      "Student Name",
+      "Terminal ID",
+      "Time Source",
+      "Verification Status",
+      "Terminal Recorded Time",
+      "Phone Attendance Time",
+      "Clock Skew (sec)",
+      "Server Ingest Time",
+      "Reviewer",
+      "Reviewed At",
+      "Notes",
+    ];
+    const rows = reviewQueue.map((r) => [
+      r.event_id,
+      r.matric_number || "",
+      r.student_name || "",
+      r.terminal_id,
+      r.time_source,
+      r.time_verification_status,
+      r.terminal_saved_at || "",
+      r.phone_attendance_time || "",
+      r.clock_skew_seconds !== null ? String(r.clock_skew_seconds) : "",
+      r.server_received_at,
+      r.reviewer_name || "",
+      r.reviewed_at || "",
+      (r.review_notes || "").replace(/"/g, '""'),
+    ]);
+    const csvContent = [headers.join(","), ...rows.map((row) => row.map((cell) => `"${cell}"`).join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", `attendance_time_reviews_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+
+    setActionMsg({
+      text: "Exported attendance time review queue to CSV.",
+      type: "success",
+    });
+  };
 
   // Filter students
   const filteredStudents = students.filter((s) => {
@@ -150,6 +272,24 @@ export function DeviceManagement() {
   });
 
   const pendingRequests = changeRequests.filter((r) => r.status === "pending");
+  const pendingTimeReviewsCount = reviewQueue.filter(
+    (r) => r.time_verification_status === "pending_review" || r.time_verification_status === "flagged_anomalous"
+  ).length;
+
+  const filteredReviews = reviewQueue.filter((r) => {
+    const q = reviewSearchQuery.toLowerCase().trim();
+    const matchesSearch =
+      !q ||
+      (r.student_name && r.student_name.toLowerCase().includes(q)) ||
+      (r.matric_number && r.matric_number.toLowerCase().includes(q)) ||
+      (r.terminal_id && r.terminal_id.toLowerCase().includes(q)) ||
+      (r.event_id && r.event_id.toLowerCase().includes(q));
+
+    if (reviewFilterStatus !== "all" && r.time_verification_status !== reviewFilterStatus) {
+      return false;
+    }
+    return matchesSearch;
+  });
 
   // Approve Change Request
   const handleApproveRequest = async (req: ChangeRequest) => {
@@ -287,6 +427,12 @@ export function DeviceManagement() {
             {pendingRequests.length}
           </div>
         </div>
+        <div className="card" style={{ padding: 14 }}>
+          <div className="text-xs text-muted">Pending Time Reviews</div>
+          <div style={{ fontSize: "1.5rem", fontWeight: 700, marginTop: 4, color: pendingTimeReviewsCount > 0 ? "#d97706" : "inherit" }}>
+            {pendingTimeReviewsCount}
+          </div>
+        </div>
       </div>
 
       {actionMsg && (
@@ -370,6 +516,20 @@ export function DeviceManagement() {
           onClick={() => setActiveTab("audit")}
         >
           📜 Audit History ({auditLogs.length})
+        </button>
+        <button
+          style={{
+            padding: "10px 18px",
+            background: "none",
+            border: "none",
+            borderBottom: activeTab === "time_reviews" ? "2px solid #2563eb" : "none",
+            color: activeTab === "time_reviews" ? "#2563eb" : "var(--color-text-muted)",
+            fontWeight: activeTab === "time_reviews" ? 600 : 500,
+            cursor: "pointer",
+          }}
+          onClick={() => setActiveTab("time_reviews")}
+        >
+          ⏰ Time Reviews {pendingTimeReviewsCount > 0 ? `(${pendingTimeReviewsCount})` : ""}
         </button>
       </div>
 
@@ -684,6 +844,156 @@ export function DeviceManagement() {
         </div>
       )}
 
+      {/* TAB 5: Time Provenance & Reviews */}
+      {activeTab === "time_reviews" && (
+        <div className="card">
+          <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flex: 1, minWidth: 260 }}>
+              <input
+                type="text"
+                className="input input-sm"
+                placeholder="Search by student name, matric, or terminal..."
+                value={reviewSearchQuery}
+                onChange={(e) => setReviewSearchQuery(e.target.value)}
+                style={{ width: "100%", maxWidth: 360 }}
+              />
+              <select
+                className="input input-sm"
+                value={reviewFilterStatus}
+                onChange={(e) => setReviewFilterStatus(e.target.value)}
+                style={{ padding: "4px 8px" }}
+              >
+                <option value="all">All Verification Statuses</option>
+                <option value="pending_review">Pending Review Only</option>
+                <option value="flagged_anomalous">Anomalous / Out-of-Window</option>
+                <option value="verified">Verified Only</option>
+                <option value="rejected">Rejected Only</option>
+              </select>
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={handleExportReviewQueueCSV}
+                disabled={reviewQueue.length === 0}
+              >
+                📥 Export Reviews CSV
+              </button>
+              <div className="text-xs text-muted">
+                Showing {filteredReviews.length} of {reviewQueue.length} records
+              </div>
+            </div>
+          </div>
+
+          <div className="table-wrapper">
+            {loading ? (
+              <div className="table-empty"><span className="spinner" /></div>
+            ) : filteredReviews.length === 0 ? (
+              <div className="table-empty">
+                <p>No attendance records match the selected review filter.</p>
+              </div>
+            ) : (
+              <table>
+                <thead>
+                  <tr>
+                    <th>Student</th>
+                    <th>Terminal</th>
+                    <th>Time Source</th>
+                    <th>Status</th>
+                    <th>Terminal Recorded Time</th>
+                    <th>Phone Timestamp</th>
+                    <th>Clock Skew</th>
+                    <th>Cloud Ingested At</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredReviews.map((r) => {
+                    const skewStr = r.clock_skew_seconds !== null
+                      ? `${r.clock_skew_seconds}s (${Math.round(r.clock_skew_seconds / 60)}m)`
+                      : "—";
+
+                    return (
+                      <tr key={r.id || r.event_id}>
+                        <td>
+                          <div style={{ fontWeight: 500 }}>{r.student_name || "Unknown Student"}</div>
+                          <code style={{ fontSize: "var(--text-xs)", background: "var(--color-bg)", padding: "2px 6px", borderRadius: 4 }}>
+                            {r.matric_number || "—"}
+                          </code>
+                        </td>
+                        <td>
+                          <div style={{ fontWeight: 500 }}>{r.terminal_id}</div>
+                          {r.terminal_name && <div className="text-xs text-muted">{r.terminal_name}</div>}
+                        </td>
+                        <td>
+                          {r.time_source === "ntp" ? (
+                            <span className="badge badge-success">🟢 NTP Attested</span>
+                          ) : r.time_source === "rtc" ? (
+                            <span className="badge badge-neutral">🔵 Hardware RTC</span>
+                          ) : r.time_source === "provisional_phone" ? (
+                            <span className="badge badge-warning">🟡 Provisional Phone</span>
+                          ) : r.time_source === "unsynchronized" ? (
+                            <span className="badge badge-neutral">⚪ Unsynchronized</span>
+                          ) : (
+                            <span className="badge badge-neutral" style={{ background: "#fed7aa", color: "#9a3412" }}>
+                              🟠 Unknown (Unsigned)
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {r.time_verification_status === "verified" ? (
+                            <span className="badge badge-success">Verified</span>
+                          ) : r.time_verification_status === "flagged_anomalous" ? (
+                            <span className="badge badge-danger">⚠️ Anomalous Skew</span>
+                          ) : r.time_verification_status === "rejected" ? (
+                            <span className="badge badge-danger">Rejected</span>
+                          ) : (
+                            <span className="badge badge-warning">Pending Review</span>
+                          )}
+                        </td>
+                        <td className="text-xs" style={{ whiteSpace: "nowrap" }}>
+                          {r.terminal_saved_at ? new Date(r.terminal_saved_at).toLocaleString() : "—"}
+                        </td>
+                        <td className="text-xs text-muted" style={{ whiteSpace: "nowrap" }}>
+                          {r.phone_attendance_time ? new Date(r.phone_attendance_time).toLocaleString() : "—"}
+                        </td>
+                        <td className="text-xs">
+                          {r.clock_skew_seconds !== null && r.clock_skew_seconds > 900 ? (
+                            <span style={{ color: "#dc2626", fontWeight: 600 }}>{skewStr}</span>
+                          ) : (
+                            <span>{skewStr}</span>
+                          )}
+                        </td>
+                        <td className="text-xs text-muted" style={{ whiteSpace: "nowrap" }}>
+                          {r.server_received_at ? new Date(r.server_received_at).toLocaleTimeString() : "—"}
+                        </td>
+                        <td>
+                          <button
+                            className="btn btn-secondary btn-sm"
+                            onClick={() => {
+                              setSelectedRecordForReview(r);
+                              setReviewDecision(
+                                r.time_verification_status === "rejected"
+                                  ? "rejected"
+                                  : r.time_verification_status === "flagged_anomalous"
+                                  ? "flagged_anomalous"
+                                  : "verified"
+                              );
+                              setReviewNotes(r.review_notes || "");
+                            }}
+                          >
+                            Review
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Device Management Modal for a selected student */}
       {selectedStudentForModal && (
         <DeviceManagementModal
@@ -800,6 +1110,120 @@ export function DeviceManagement() {
               </button>
               <button className="btn btn-danger btn-sm" onClick={handleRejectRequest}>
                 Confirm Rejection
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Review Provisional Attendance Record Modal */}
+      {selectedRecordForReview && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 520 }}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>Review Provisional Attendance Record</h3>
+              <button className="modal-close" onClick={() => setSelectedRecordForReview(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div style={{ background: "var(--color-bg)", padding: 12, borderRadius: 6, marginBottom: 14 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className="text-xs text-muted">Student:</span>
+                  <span style={{ fontWeight: 600 }}>{selectedRecordForReview.student_name} ({selectedRecordForReview.matric_number})</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className="text-xs text-muted">Terminal ID:</span>
+                  <code>{selectedRecordForReview.terminal_id}</code>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className="text-xs text-muted">Time Source:</span>
+                  <span>{selectedRecordForReview.time_source}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className="text-xs text-muted">Terminal Recorded Time:</span>
+                  <span className="text-xs">{selectedRecordForReview.terminal_saved_at || "—"}</span>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                  <span className="text-xs text-muted">Phone Submitted Time:</span>
+                  <span className="text-xs">{selectedRecordForReview.phone_attendance_time || "—"}</span>
+                </div>
+                {selectedRecordForReview.clock_skew_seconds !== null && (
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span className="text-xs text-muted">Clock Skew:</span>
+                    <span style={{ color: selectedRecordForReview.clock_skew_seconds > 900 ? "#dc2626" : "inherit", fontWeight: 600 }}>
+                      {selectedRecordForReview.clock_skew_seconds} seconds
+                    </span>
+                  </div>
+                )}
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <span className="text-xs text-muted">Server Ingest Time:</span>
+                  <span className="text-xs text-muted">{selectedRecordForReview.server_received_at}</span>
+                </div>
+              </div>
+
+              <div>
+                <label className="text-xs text-muted" style={{ display: "block", marginBottom: 6, fontWeight: 600 }}>
+                  Verification Decision
+                </label>
+                <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13 }}>
+                    <input
+                      type="radio"
+                      name="decision"
+                      value="verified"
+                      checked={reviewDecision === "verified"}
+                      onChange={() => setReviewDecision("verified")}
+                    />
+                    <span>Verify (Approved)</span>
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13 }}>
+                    <input
+                      type="radio"
+                      name="decision"
+                      value="flagged_anomalous"
+                      checked={reviewDecision === "flagged_anomalous"}
+                      onChange={() => setReviewDecision("flagged_anomalous")}
+                    />
+                    <span>Flag Anomalous</span>
+                  </label>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer", fontSize: 13 }}>
+                    <input
+                      type="radio"
+                      name="decision"
+                      value="rejected"
+                      checked={reviewDecision === "rejected"}
+                      onChange={() => setReviewDecision("rejected")}
+                    />
+                    <span>Reject</span>
+                  </label>
+                </div>
+
+                <label className="text-xs text-muted" style={{ display: "block", marginBottom: 4 }}>
+                  Review Notes / Justification
+                </label>
+                <textarea
+                  className="input input-sm"
+                  rows={3}
+                  style={{ width: "100%", resize: "vertical" }}
+                  placeholder="e.g. Verified by lecturer against sign-in sheet, or out-of-window phone time."
+                  value={reviewNotes}
+                  onChange={(e) => setReviewNotes(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => setSelectedRecordForReview(null)}
+                disabled={submittingReview}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleSubmitReview}
+                disabled={submittingReview}
+              >
+                {submittingReview ? "Saving..." : "Save Review Decision"}
               </button>
             </div>
           </div>

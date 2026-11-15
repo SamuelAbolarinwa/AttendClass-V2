@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TerminalTimeProvenanceStatement",
+  "description": "Terminal-signed statement attesting the provenance of recorded timestamps under the terminal P-256 key.",
+  "type": "object",
+  "required": [
+    "version",
+    "event_id",
+    "terminal_id",
+    "recorded_timestamp",
+    "phone_timestamp",
+    "clock_source",
+    "submission_digest",
+    "signature"
+  ],
+  "properties": {
+    "version": { "type": "integer", "const": 2 },
+    "event_id": { "type": "string" },
+    "terminal_id": { "type": "string" },
+    "session_id": { "type": ["string", "null"] },
+    "recorded_timestamp": { "type": "string" },
+    "phone_timestamp": { "type": "string" },
+    "clock_source": {
+      "type": "string",
+      "enum": ["ntp", "rtc", "provisional_phone", "unsynchronized"]
+    },
+    "submission_digest": { "type": "string" },
+    "signature": { "type": "string", "description": "Base64 encoded ECDSA P-256 signature (ASN.1 DER or Compact P1363)" }
+  },
+  "additionalProperties": false
+}

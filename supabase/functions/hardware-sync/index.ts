@@ -227,10 +227,29 @@ async function processSignedAttendanceRow(
     };
   }
 
+  // Provenance statement inputs
+  const rawProvenanceSig = (raw.terminal_provenance_sig || raw.provenance_signature || raw.terminalProvenanceSig)?.trim();
+  const rawClockSource = (raw.clock_source || raw.time_source || raw.clockSource || raw.selected_source)?.trim().toLowerCase();
+  const rawRecordedTimestamp = (raw.recorded_timestamp || raw.recordedTimestamp || raw.terminal_saved_at)?.trim();
+  const rawPhoneTimestamp = (raw.phone_timestamp || raw.phoneTimestamp || (timestamp > 0 ? String(timestamp) : ""))?.trim();
+
+  // Resolve terminal public key for provenance / receipt verification
+  let terminalPublicKey = uploadingTerminal.public_key;
+  if (!terminalPublicKey && terminalId) {
+    const { data: termDev } = await supabase
+      .from("devices")
+      .select("public_key")
+      .eq("device_id", terminalId)
+      .maybeSingle();
+    if (termDev?.public_key) {
+      terminalPublicKey = termDev.public_key;
+    }
+  }
+
   // 1. Idempotency & Conflict Check: detect existing event_id
   const { data: existingLog, error: existErr } = await supabase
     .from("attendance_logs")
-    .select("id, student_id, terminal_id, method, submission_digest")
+    .select("id, student_id, terminal_id, method, submission_digest, terminal_provenance_sig, time_source, time_verification_status")
     .eq("event_id", eventId)
     .maybeSingle();
 
@@ -257,6 +276,70 @@ async function processSignedAttendanceRow(
         reason: `EVENT_ID_CONFLICT: Duplicate event_id ${eventId} submitted with conflicting student or terminal data`,
       };
     }
+
+    // Retroactive upgrade: if existing row lacks provenance and incoming record provides a valid statement
+    if (rawProvenanceSig && !existingLog.terminal_provenance_sig) {
+      if (!terminalPublicKey) {
+        return {
+          ok: false,
+          status: "REJECTED",
+          event_id: eventId,
+          matric_number: matric,
+          reason: `UNREGISTERED_TERMINAL_KEY: Terminal ${terminalId} public key required for provenance upgrade`,
+        };
+      }
+      const clockSource = ["ntp", "rtc", "provisional_phone", "unsynchronized"].includes(rawClockSource)
+        ? rawClockSource
+        : "unknown";
+      if (clockSource === "unknown") {
+        return {
+          ok: false,
+          status: "REJECTED",
+          event_id: eventId,
+          matric_number: matric,
+          reason: `INVALID_CLOCK_SOURCE: Unknown clock source "${rawClockSource}"`,
+        };
+      }
+
+      const digestToVerify = submissionDigest || existingLog.submission_digest || "";
+      const canonicalProv = raw.provenance_canonical?.trim() || [
+        "v2",
+        "provenance",
+        eventId,
+        terminalId,
+        sessionId || "",
+        rawRecordedTimestamp || "",
+        rawPhoneTimestamp || "",
+        clockSource,
+        digestToVerify,
+      ].join("|");
+
+      const isProvValid = await verifyP256Signature(canonicalProv, rawProvenanceSig, terminalPublicKey);
+      if (!isProvValid) {
+        return {
+          ok: false,
+          status: "REJECTED",
+          event_id: eventId,
+          matric_number: matric,
+          reason: `INVALID_PROVENANCE_SIGNATURE: Provenance signature verification failed for ${eventId}`,
+        };
+      }
+
+      const effectiveStatus = clockSource === "ntp" ? "verified" : "pending_review";
+      await supabase
+        .from("attendance_logs")
+        .update({
+          time_source: clockSource,
+          time_verification_status: effectiveStatus,
+          terminal_provenance_sig: rawProvenanceSig,
+          provenance_canonical: canonicalProv,
+          server_received_at: new Date().toISOString(),
+        })
+        .eq("id", existingLog.id);
+
+      return { ok: true, status: "ACCEPTED", event_id: eventId, matric_number: matric };
+    }
+
     return { ok: true, status: "DUPLICATE", event_id: eventId, matric_number: matric };
   }
 
@@ -409,7 +492,7 @@ async function processSignedAttendanceRow(
     }
   }
 
-  // 5. Timestamps
+  // 5. Timestamps & Anomaly Detection
   const phoneTime = timestamp > 0 ? new Date(timestamp * 1000).toISOString() : new Date().toISOString();
   let terminalSavedAt: string | null = null;
   if (raw.terminal_saved_at) {
@@ -421,7 +504,109 @@ async function processSignedAttendanceRow(
     }
   }
 
-  // 6. Idempotent Insert into attendance_logs
+  // Check clock skew between phone and terminal
+  let isAnomalous = false;
+  if (terminalSavedAt && phoneTime) {
+    const termMs = new Date(terminalSavedAt).getTime();
+    const phoneMs = new Date(phoneTime).getTime();
+    if (!isNaN(termMs) && !isNaN(phoneMs)) {
+      const skewSeconds = Math.abs((termMs - phoneMs) / 1000);
+      if (skewSeconds > 900) { // Skew > 15 minutes (900 seconds)
+        isAnomalous = true;
+      }
+    }
+  }
+  // Check if phone time is excessively in the future compared to server ingest
+  const nowMs = Date.now();
+  const phoneMs = new Date(phoneTime).getTime();
+  if (!isNaN(phoneMs) && phoneMs - nowMs > 600 * 1000) { // > 10 minutes in the future
+    isAnomalous = true;
+  }
+
+  // 6. Time Provenance Evaluation
+  let timeSource = "unknown";
+  let timeVerificationStatus = "pending_review";
+  let terminalProvenanceSig: string | null = null;
+  let provenanceCanonical: string | null = null;
+
+  if (rawProvenanceSig) {
+    if (!terminalPublicKey) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `UNREGISTERED_TERMINAL_KEY: Terminal ${terminalId} does not have a registered public key for provenance verification`,
+      };
+    }
+
+    const clockSource = ["ntp", "rtc", "provisional_phone", "unsynchronized"].includes(rawClockSource)
+      ? rawClockSource
+      : "unknown";
+
+    if (clockSource === "unknown") {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `INVALID_CLOCK_SOURCE: Unrecognized clock source "${rawClockSource}" in provenance statement`,
+      };
+    }
+
+    const recordedTimestamp = rawRecordedTimestamp || raw.terminal_saved_at?.trim() || "";
+    const phoneTimestamp = rawPhoneTimestamp || (timestamp > 0 ? String(timestamp) : phoneTime);
+
+    const digestToVerify = submissionDigest || (signature && publicKey ? await sha256Hex([
+      "v1", "submission", eventId, credentialId, credentialVersion,
+      matchedDevice?.algorithm || "ECDSA_P256_SHA256", student.id, matric, terminalId,
+      sessionId || "", challenge, timestamp.toString(), timestampSource
+    ].join("|")) : "");
+
+    const canonicalProv = raw.provenance_canonical?.trim() || [
+      "v2",
+      "provenance",
+      eventId,
+      terminalId,
+      sessionId || "",
+      recordedTimestamp,
+      phoneTimestamp,
+      clockSource,
+      digestToVerify,
+    ].join("|");
+
+    const isProvValid = await verifyP256Signature(canonicalProv, rawProvenanceSig, terminalPublicKey);
+    if (!isProvValid) {
+      return {
+        ok: false,
+        status: "REJECTED",
+        event_id: eventId,
+        matric_number: matric,
+        reason: `INVALID_PROVENANCE_SIGNATURE: Terminal time provenance signature verification failed for ${eventId}`,
+      };
+    }
+
+    terminalProvenanceSig = rawProvenanceSig;
+    provenanceCanonical = canonicalProv;
+    timeSource = clockSource;
+
+    if (isAnomalous) {
+      timeVerificationStatus = "flagged_anomalous";
+    } else if (clockSource === "ntp") {
+      timeVerificationStatus = "verified";
+    } else {
+      timeVerificationStatus = "pending_review";
+    }
+  } else {
+    timeSource = "unknown";
+    if (isAnomalous) {
+      timeVerificationStatus = "flagged_anomalous";
+    } else {
+      timeVerificationStatus = "pending_review";
+    }
+  }
+
+  // 7. Idempotent Insert into attendance_logs
   const verifiedAt = terminalSavedAt || phoneTime || new Date().toISOString();
   const { error: insertErr } = await supabase.from("attendance_logs").insert({
     session_id: sessionId,
@@ -436,6 +621,11 @@ async function processSignedAttendanceRow(
     submission_digest: submissionDigest || null,
     offline_verified: true,
     verified_at: verifiedAt,
+    time_source: timeSource,
+    time_verification_status: timeVerificationStatus,
+    terminal_provenance_sig: terminalProvenanceSig,
+    provenance_canonical: provenanceCanonical,
+    server_received_at: new Date().toISOString(),
   });
 
   if (insertErr) {
@@ -494,6 +684,9 @@ async function processAttendanceRow(
     method,
     verified_at: verifiedAt,
     offline_verified: false,
+    time_source: "ntp",
+    time_verification_status: "verified",
+    server_received_at: new Date().toISOString(),
   });
 
   if (insertErr) {
@@ -695,7 +888,19 @@ Deno.serve(async (req: Request): Promise<Response> => {
         public_key: r.public_key || r.publicKey || "",
         signature: r.signature || "",
         challenge: r.challenge || "",
+        terminal_provenance_sig: r.terminal_provenance_sig || r.terminalProvenanceSig || r.provenance_signature || "",
+        clock_source: r.clock_source || r.time_source || r.clockSource || r.selected_source || "",
+        phone_timestamp: r.phone_timestamp || r.phoneTimestamp || "",
+        recorded_timestamp: r.recorded_timestamp || r.recordedTimestamp || "",
+        provenance_canonical: r.provenance_canonical || r.provenanceCanonical || "",
       };
+
+      if (r.provenance_statement && typeof r.provenance_statement === "object") {
+        rowRecord.terminal_provenance_sig = r.provenance_statement.signature || rowRecord.terminal_provenance_sig;
+        rowRecord.clock_source = r.provenance_statement.clock_source || rowRecord.clock_source;
+        rowRecord.recorded_timestamp = r.provenance_statement.recorded_timestamp || rowRecord.recorded_timestamp;
+        rowRecord.phone_timestamp = r.provenance_statement.phone_timestamp || rowRecord.phone_timestamp;
+      }
 
       const result = await processSignedAttendanceRow(supabase, rowRecord, effectiveTerminal);
       if (result.status === "ACCEPTED") rowsAccepted++;
@@ -812,6 +1017,8 @@ Deno.serve(async (req: Request): Promise<Response> => {
           algorithm: c[13] ?? "ECDSA_P256_SHA256",
           submission_digest: c[14] ?? "",
           terminal_receipt_signature: c[15] ?? "",
+          terminal_provenance_sig: c[16] ?? "",
+          clock_source: c[17] ?? "",
         };
       });
     }
