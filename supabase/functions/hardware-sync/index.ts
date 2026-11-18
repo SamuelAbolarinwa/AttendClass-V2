@@ -162,7 +162,7 @@ function splitCSVLine(line: string): string[] {
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, x-sync-file-type, x-device-key, x-sync-action, authorization, apikey",
+  "Access-Control-Allow-Headers": "Content-Type, x-sync-file-type, x-device-key, x-sync-action, x-terminal-id, authorization, apikey",
 };
 
 /** Build a JSON response with CORS headers. */
@@ -802,6 +802,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   const deviceKey = req.headers.get("x-device-key");
   const fileType = req.headers.get("x-sync-file-type");
   const syncAction = req.headers.get("x-sync-action")?.trim().toLowerCase();
+  const headerTerminalId = req.headers.get("x-terminal-id")?.trim();
 
   // Read request body
   let rawBodyText = "";
@@ -818,7 +819,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
   // ══════════════════════════════════════════════════════════════════════════
   // BRANCH 1: Mobile Admin BLE Sync Bridge ({ action: 'sync_attendance_batch' })
   // ══════════════════════════════════════════════════════════════════════════
-  if (jsonBody && (jsonBody.action === "sync_attendance_batch" || jsonBody.action === "get_enrolled_keys")) {
+  if (jsonBody && (jsonBody.action === "sync_attendance_batch" || jsonBody.action === "get_enrolled_keys" || jsonBody.action === "get_terminal_provisioning")) {
     const adminToken = jsonBody.admin_token;
     if (!adminToken) {
       return json({ error: "Unauthorized: admin_token required for mobile admin sync bridge" }, 401);
@@ -850,6 +851,22 @@ Deno.serve(async (req: Request): Promise<Response> => {
     if (jsonBody.action === "get_enrolled_keys") {
       const keys = await fetchEnrolledKeys();
       return json({ ok: true, enrolled_keys: keys });
+    }
+
+    // Action: get_terminal_provisioning
+    if (jsonBody.action === "get_terminal_provisioning") {
+      const termId = jsonBody.terminal_id;
+      if (!termId) {
+        return json({ ok: false, error: "MISSING_TERMINAL_ID", message: "terminal_id required" }, 400);
+      }
+      const { data: provData, error: provErr } = await supabase.rpc("platform_get_terminal_provisioning", {
+        p_admin_token: adminToken,
+        p_terminal_id: termId,
+      });
+      if (provErr) {
+        return json({ ok: false, error: "RPC_ERROR", message: provErr.message }, 500);
+      }
+      return json(provData);
     }
 
     // Action: sync_attendance_batch
@@ -937,6 +954,254 @@ Deno.serve(async (req: Request): Promise<Response> => {
       records: recordOutcomes,
       enrolled_keys: enrolledKeys,
     });
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // BRANCH 1.5: Offline Terminal Provisioning Contract (attendclass.offline.v1)
+  // ══════════════════════════════════════════════════════════════════════════
+  const isProvisionAction = syncAction === "provision_terminal" || (jsonBody && jsonBody.action === "provision_terminal");
+  if (isProvisionAction) {
+    if (!deviceKey) {
+      return json({ ok: false, error: "UNAUTHORIZED", message: "Missing x-device-key header" }, 401);
+    }
+
+    if (!headerTerminalId) {
+      return json({ ok: false, error: "MISSING_TERMINAL_ID", message: "Missing x-terminal-id header" }, 400);
+    }
+
+    if (!jsonBody || typeof jsonBody !== "object" || Array.isArray(jsonBody)) {
+      return json({ ok: false, error: "INVALID_JSON_BODY", message: "Expected JSON object body" }, 400);
+    }
+
+    if (jsonBody.protocol !== "attendclass.offline.v1") {
+      return json({
+        ok: false,
+        error: "UNSUPPORTED_PROTOCOL",
+        message: "Protocol must be 'attendclass.offline.v1'",
+      }, 400);
+    }
+
+    const bodyTerminalId = jsonBody.terminal_id?.trim();
+    if (!bodyTerminalId) {
+      return json({ ok: false, error: "MISSING_TERMINAL_ID", message: "Missing terminal_id in JSON body" }, 400);
+    }
+
+    if (headerTerminalId !== bodyTerminalId) {
+      return json({
+        ok: false,
+        error: "TERMINAL_MISMATCH",
+        message: `Header x-terminal-id (${headerTerminalId}) does not match body terminal_id (${bodyTerminalId})`,
+      }, 400);
+    }
+
+    // Authenticate terminal device via SHA-256 key hash
+    const keyHash = await sha256Hex(deviceKey);
+    const { data: device, error: devErr } = await supabase
+      .from("devices")
+      .select("id, device_id, name, location, public_key, algorithm, is_active, provisioned_version, last_sync_at")
+      .eq("device_key_hash", keyHash)
+      .maybeSingle();
+
+    if (devErr || !device) {
+      return json({ ok: false, error: "UNAUTHORIZED", message: "Terminal key not recognized" }, 401);
+    }
+
+    if (device.device_id !== headerTerminalId) {
+      return json({
+        ok: false,
+        error: "TERMINAL_MISMATCH",
+        message: `Terminal key is registered for ${device.device_id}, not ${headerTerminalId}`,
+      }, 403);
+    }
+
+    if (device.is_active === false) {
+      return json({ ok: false, error: "FORBIDDEN", message: "Terminal device is deactivated" }, 403);
+    }
+
+    // Query active unclosed attendance sessions for this terminal
+    const { data: openSessions, error: sessErr } = await supabase
+      .from("attendance_sessions")
+      .select(`
+        id,
+        opened_at,
+        closed_at,
+        device_id,
+        schedule_id,
+        schedules (
+          id,
+          course_id,
+          device_id,
+          day_of_week,
+          start_time,
+          end_time,
+          courses (
+            id,
+            code,
+            title
+          )
+        )
+      `)
+      .is("closed_at", null);
+
+    if (sessErr) {
+      return json({ ok: false, error: "DATABASE_ERROR", message: sessErr.message }, 500);
+    }
+
+    const matchingSessions = (openSessions || []).filter((s: any) => {
+      const sSched = Array.isArray(s.schedules) ? s.schedules[0] : s.schedules;
+      return s.device_id === device.id || sSched?.device_id === device.id;
+    });
+
+    if (matchingSessions.length > 1) {
+      return json({
+        ok: false,
+        error: "MULTIPLE_ACTIVE_SESSIONS",
+        message: "Terminal has multiple concurrent unclosed sessions",
+      }, 409);
+    }
+
+    const nextVersion = (device.provisioned_version || 0) + 1;
+
+    await supabase
+      .from("devices")
+      .update({
+        provisioned_version: nextVersion,
+        last_sync_at: new Date().toISOString(),
+      })
+      .eq("id", device.id);
+
+    if (matchingSessions.length === 0) {
+      return json({
+        ok: true,
+        terminal_id: device.device_id,
+        provisioning_version: nextVersion,
+        active_session: null,
+        enrolled_keys: [],
+      }, 200);
+    }
+
+    const activeSess = matchingSessions[0];
+    const schedule = Array.isArray(activeSess.schedules) ? activeSess.schedules[0] : activeSess.schedules;
+    const course = Array.isArray(schedule?.courses) ? schedule?.courses[0] : schedule?.courses;
+    let courseCode = course?.code || "UNKNOWN";
+    let courseId = schedule?.course_id;
+
+    if (!courseId && activeSess.schedule_id) {
+      const { data: directSched } = await supabase
+        .from("schedules")
+        .select("id, course_id, courses(code)")
+        .eq("id", activeSess.schedule_id)
+        .maybeSingle();
+      if (directSched) {
+        courseId = directSched.course_id;
+        const dCourse = Array.isArray(directSched.courses) ? directSched.courses[0] : directSched.courses;
+        if (dCourse?.code) {
+          courseCode = dCourse.code;
+        }
+      }
+    }
+
+    const openedAtDate = new Date(activeSess.opened_at);
+    const startUnix = Math.floor(openedAtDate.getTime() / 1000);
+
+    const lagosFormatter = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Africa/Lagos",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    const lagosDate = lagosFormatter.format(openedAtDate);
+
+    let endUnix = startUnix + 3600;
+
+    if (schedule?.end_time) {
+      const timeParts = schedule.end_time.split(":");
+      const hh = timeParts[0].padStart(2, "0");
+      const mm = (timeParts[1] || "00").padStart(2, "0");
+      const ss = (timeParts[2] || "00").split(".")[0].padStart(2, "0");
+      const lagosEndIso = `${lagosDate}T${hh}:${mm}:${ss}+01:00`;
+      const scheduledEndUnix = Math.floor(new Date(lagosEndIso).getTime() / 1000);
+
+      if (!isNaN(scheduledEndUnix) && scheduledEndUnix > startUnix) {
+        endUnix = scheduledEndUnix;
+      } else if (schedule.start_time) {
+        const startParts = schedule.start_time.split(":");
+        const sSec = parseInt(startParts[0], 10) * 3600 + parseInt(startParts[1] || "0", 10) * 60;
+        const eSec = parseInt(timeParts[0], 10) * 3600 + parseInt(timeParts[1] || "0", 10) * 60;
+        const duration = eSec - sSec;
+        if (duration > 0) {
+          endUnix = startUnix + duration;
+        }
+      }
+    }
+
+    if (endUnix <= startUnix) {
+      endUnix = startUnix + 3600;
+    }
+
+    let enrolledKeys: Array<{
+      student_id: string;
+      matric_number: string;
+      public_key: string;
+      credential_id: string;
+      algorithm: string;
+    }> = [];
+
+    if (courseId) {
+      const { data: enrollments, error: enrollErr } = await supabase
+        .from("enrollments")
+        .select("student_id, profiles(id, matric_number, full_name)")
+        .eq("course_id", courseId);
+
+      if (!enrollErr && enrollments && enrollments.length > 0) {
+        const studentIds = enrollments.map((e: any) => e.student_id);
+        const profileMap = new Map<string, any>();
+        for (const e of enrollments) {
+          const prof = Array.isArray(e.profiles) ? e.profiles[0] : e.profiles;
+          if (prof) {
+            profileMap.set(e.student_id, prof);
+          }
+        }
+
+        const { data: studentDevices, error: devQueryErr } = await supabase
+          .from("student_devices")
+          .select("student_id, device_public_key, credential_id, algorithm, enrolled_at")
+          .in("student_id", studentIds)
+          .is("revoked_at", null)
+          .order("enrolled_at", { ascending: false });
+
+        if (!devQueryErr && studentDevices) {
+          const studentKeyMap = new Map<string, any>();
+          for (const sd of studentDevices) {
+            if (!studentKeyMap.has(sd.student_id)) {
+              const prof = profileMap.get(sd.student_id);
+              studentKeyMap.set(sd.student_id, {
+                student_id: sd.student_id,
+                matric_number: prof?.matric_number || "",
+                public_key: sd.device_public_key,
+                credential_id: sd.credential_id || "",
+                algorithm: sd.algorithm || "ECDSA_P256_SHA256",
+              });
+            }
+          }
+
+          enrolledKeys = Array.from(studentKeyMap.values()).slice(0, 200);
+        }
+      }
+    }
+
+    return json({
+      ok: true,
+      terminal_id: device.device_id,
+      provisioning_version: nextVersion,
+      active_session: {
+        session_id: activeSess.id,
+        course_code: courseCode,
+        start_unix: startUnix,
+        end_unix: endUnix,
+      },
+      enrolled_keys: enrolledKeys,
+    }, 200);
   }
 
   // ══════════════════════════════════════════════════════════════════════════

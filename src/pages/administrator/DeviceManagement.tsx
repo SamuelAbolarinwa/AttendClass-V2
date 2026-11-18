@@ -33,7 +33,23 @@ interface TerminalDevice {
   algorithm?: string;
   is_active: boolean;
   last_sync_at?: string | null;
+  provisioned_version?: number | null;
   rssi_threshold_dbm?: number;
+}
+
+interface TerminalDetails {
+  activeSession: {
+    id: string;
+    course_code: string;
+    start_unix: number;
+    end_unix: number;
+  } | null;
+  assignedSchedule: {
+    course_code: string;
+    day_name: string;
+    time_slot: string;
+  } | null;
+  enrolledKeyCount: number;
 }
 
 interface AuditLog {
@@ -94,12 +110,21 @@ export function DeviceManagement() {
   const [rejectReason, setRejectReason] = useState("Device replacement denied by lecturer/administrator.");
   const [approvingReqId, setApprovingReqId] = useState<string | null>(null);
 
+  // Terminal Provisioning & Management States
+  const [terminalDetailsMap, setTerminalDetailsMap] = useState<Record<string, TerminalDetails>>({});
+  const [selectedTerminalForEditKey, setSelectedTerminalForEditKey] = useState<TerminalDevice | null>(null);
+  const [newTerminalKey, setNewTerminalKey] = useState<string>("");
+  const [submittingKey, setSubmittingKey] = useState<boolean>(false);
+  const [selectedTerminalForBundle, setSelectedTerminalForBundle] = useState<TerminalDevice | null>(null);
+  const [bundleLoading, setBundleLoading] = useState<boolean>(false);
+  const [bundleData, setBundleData] = useState<any>(null);
+
   const fetchData = async () => {
     setLoading(true);
     setActionMsg(null);
     try {
-      // 1. Fetch Students & Active Devices
-      const [profilesRes, devicesRes, requestsRes, terminalsRes] = await Promise.all([
+      // 1. Fetch Students, Active Devices, Schedules & Active Sessions
+      const [profilesRes, devicesRes, requestsRes, terminalsRes, schedulesRes, sessionsRes, enrollmentsRes] = await Promise.all([
         supabase
           .from("profiles")
           .select("id, full_name, matric_number, identifier, must_change_password, created_at")
@@ -115,8 +140,18 @@ export function DeviceManagement() {
           .order("created_at", { ascending: false }),
         supabase
           .from("devices")
-          .select("id, device_id, name, location, public_key, algorithm, is_active, last_sync_at, rssi_threshold_dbm")
+          .select("id, device_id, name, location, public_key, algorithm, is_active, last_sync_at, provisioned_version, rssi_threshold_dbm")
           .order("device_id"),
+        supabase
+          .from("schedules")
+          .select("id, course_id, device_id, day_of_week, start_time, end_time, courses(id, code, title)"),
+        supabase
+          .from("attendance_sessions")
+          .select("id, schedule_id, device_id, opened_at, closed_at, schedules(id, course_id, device_id, start_time, end_time, courses(id, code, title))")
+          .is("closed_at", null),
+        supabase
+          .from("enrollments")
+          .select("student_id, course_id"),
       ]);
 
       const studentList = profilesRes.data ?? [];
@@ -139,7 +174,65 @@ export function DeviceManagement() {
       }));
       setChangeRequests(reqList);
 
-      setTerminals(terminalsRes.data ?? []);
+      const terminalList = terminalsRes.data ?? [];
+      setTerminals(terminalList);
+
+      // Map Schedule, Active Session & Enrolled Student Count for each Terminal
+      const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+      const detailsMap: Record<string, TerminalDetails> = {};
+      const allSchedules = schedulesRes.data ?? [];
+      const allSessions = sessionsRes.data ?? [];
+      const allEnrollments = enrollmentsRes.data ?? [];
+
+      for (const t of terminalList) {
+        // Find assigned schedule
+        const sched: any = allSchedules.find((s: any) => s.device_id === t.id);
+        let assignedSchedule = null;
+        if (sched) {
+          const dayName = DAYS[sched.day_of_week] || `Day ${sched.day_of_week}`;
+          const timeSlot = `${(sched.start_time || "").slice(0, 5)} - ${(sched.end_time || "").slice(0, 5)}`;
+          const schedCourse = Array.isArray(sched.courses) ? sched.courses[0] : sched.courses;
+          assignedSchedule = {
+            course_code: schedCourse?.code || "Unknown",
+            day_name: dayName,
+            time_slot: timeSlot,
+          };
+        }
+
+        // Find open session
+        const matchingSess: any = allSessions.find((s: any) => {
+          const sSched = Array.isArray(s.schedules) ? s.schedules[0] : s.schedules;
+          return s.device_id === t.id || sSched?.device_id === t.id;
+        });
+        let activeSession = null;
+        let enrolledKeyCount = 0;
+
+        if (matchingSess) {
+          const sSched = Array.isArray(matchingSess.schedules) ? matchingSess.schedules[0] : matchingSess.schedules;
+          const sCourse = Array.isArray(sSched?.courses) ? sSched?.courses[0] : sSched?.courses;
+          const courseCode = sCourse?.code || "—";
+          const courseId = sSched?.course_id;
+          const startUnix = Math.floor(new Date(matchingSess.opened_at).getTime() / 1000);
+          activeSession = {
+            id: matchingSess.id,
+            course_code: courseCode,
+            start_unix: startUnix,
+            end_unix: startUnix + 3600,
+          };
+
+          if (courseId) {
+            const enrolledInCourse = allEnrollments.filter((e: any) => e.course_id === courseId);
+            enrolledKeyCount = enrolledInCourse.filter((e: any) => !!dMap[e.student_id]).length;
+          }
+        }
+
+        detailsMap[t.device_id] = {
+          activeSession,
+          assignedSchedule,
+          enrolledKeyCount,
+        };
+      }
+      setTerminalDetailsMap(detailsMap);
 
       // Fetch Audit Logs & Time Provenance Reviews
       if (account?.token) {
@@ -380,6 +473,112 @@ export function DeviceManagement() {
         text: `Failed to download CSV: ${err instanceof Error ? err.message : String(err)}`,
         type: "error",
       });
+    }
+  };
+
+  const handleOpenEditKey = (terminal: TerminalDevice) => {
+    setSelectedTerminalForEditKey(terminal);
+    setNewTerminalKey(terminal.public_key || "");
+  };
+
+  const handleSaveTerminalKey = async () => {
+    if (!account || !selectedTerminalForEditKey) return;
+    setSubmittingKey(true);
+    setActionMsg(null);
+    try {
+      const { data, error } = await supabase.rpc("platform_update_terminal_key", {
+        p_admin_token: account.token,
+        p_terminal_id: selectedTerminalForEditKey.device_id,
+        p_public_key: newTerminalKey.trim(),
+      });
+      if (error) throw error;
+      if (!data?.ok) throw new Error(data?.error || "Failed to update terminal public key");
+
+      setActionMsg({
+        text: `Terminal ${selectedTerminalForEditKey.device_id} public key updated successfully (v${data.provisioned_version}).`,
+        type: "success",
+      });
+      setSelectedTerminalForEditKey(null);
+      await fetchData();
+    } catch (err: unknown) {
+      setActionMsg({
+        text: `Error registering terminal key: ${err instanceof Error ? err.message : String(err)}`,
+        type: "error",
+      });
+    } finally {
+      setSubmittingKey(false);
+    }
+  };
+
+  const handleTriggerReprovision = async (terminal: TerminalDevice) => {
+    if (!account) return;
+    setActionMsg(null);
+    try {
+      const { data, error } = await supabase.rpc("platform_trigger_terminal_reprovision", {
+        p_admin_token: account.token,
+        p_terminal_id: terminal.device_id,
+      });
+      if (error) throw error;
+      if (!data?.ok) throw new Error(data?.error || "Failed to trigger reprovisioning");
+
+      setActionMsg({
+        text: `Reprovisioning triggered for ${terminal.device_id}. Provisioned version incremented to v${data.provisioned_version}. The terminal will reload configuration on next sync.`,
+        type: "success",
+      });
+      await fetchData();
+    } catch (err: unknown) {
+      setActionMsg({
+        text: `Error triggering reprovision: ${err instanceof Error ? err.message : String(err)}`,
+        type: "error",
+      });
+    }
+  };
+
+  const downloadJsonFile = (filename: string, content: string) => {
+    const blob = new Blob([content], { type: "application/json;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadCsvFile = (filename: string, content: string) => {
+    const blob = new Blob([content], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleOpenBundleModal = async (terminal: TerminalDevice) => {
+    if (!account) return;
+    setSelectedTerminalForBundle(terminal);
+    setBundleLoading(true);
+    setBundleData(null);
+    try {
+      const { data, error } = await supabase.rpc("platform_get_terminal_provisioning", {
+        p_admin_token: account.token,
+        p_terminal_id: terminal.device_id,
+      });
+      if (error) throw error;
+      if (!data?.ok) throw new Error(data?.message || data?.error || "Failed to load provisioning bundle");
+      setBundleData(data);
+    } catch (err: unknown) {
+      setActionMsg({
+        text: `Error loading provisioning bundle: ${err instanceof Error ? err.message : String(err)}`,
+        type: "error",
+      });
+      setSelectedTerminalForBundle(null);
+    } finally {
+      setBundleLoading(false);
     }
   };
 
@@ -714,16 +913,18 @@ export function DeviceManagement() {
       {/* TAB 3: ESP32 Terminals & Provisioning */}
       {activeTab === "terminals" && (
         <div className="card">
-          <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div className="card-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
             <div>
               <h3 style={{ margin: "0 0 2px 0" }}>Provisioned Physical Terminals (ESP32)</h3>
               <p className="text-xs text-muted" style={{ margin: 0 }}>
-                Classroom hardware terminals deployed in lecture halls with cryptographic keypairs and local SD registries.
+                Classroom hardware terminals deployed in lecture halls with cryptographic keypairs, local registries, and authoritative session provisioning.
               </p>
             </div>
-            <button className="btn btn-secondary btn-sm" onClick={handleDownloadProvisioningCSV}>
-              📥 Export Provisioning File
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn-secondary btn-sm" onClick={handleDownloadProvisioningCSV}>
+                📥 Global /enrolled_keys.csv
+              </button>
+            </div>
           </div>
 
           <div className="table-wrapper">
@@ -736,48 +937,132 @@ export function DeviceManagement() {
                 <thead>
                   <tr>
                     <th>Terminal ID</th>
-                    <th>Name / Location</th>
-                    <th>Public Key Fingerprint</th>
-                    <th>Status</th>
-                    <th>Last Synchronized</th>
+                    <th>Name / Room</th>
+                    <th>Public Key</th>
+                    <th>Assigned Timetable</th>
+                    <th>Current Session</th>
+                    <th>Enrolled Keys</th>
+                    <th>Status / Version</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {terminals.map((t) => (
-                    <tr key={t.id}>
-                      <td style={{ fontWeight: 600 }}>
-                        <code style={{ fontSize: "var(--text-xs)", background: "var(--color-bg)", padding: "2px 6px", borderRadius: 4 }}>
-                          {t.device_id}
-                        </code>
-                      </td>
-                      <td>
-                        <div>{t.name}</div>
-                        <div className="text-xs text-muted">{t.location || "Unassigned"}</div>
-                      </td>
-                      <td className="text-xs" style={{ fontFamily: "monospace" }}>
-                        {t.public_key ? `${t.public_key.slice(0, 20)}...` : "Configured on Terminal SD"}
-                      </td>
-                      <td>
-                        {t.is_active ? (
-                          <span className="badge badge-success">Operational</span>
-                        ) : (
-                          <span className="badge badge-danger">Deactivated</span>
-                        )}
-                      </td>
-                      <td className="text-xs text-muted">
-                        {t.last_sync_at ? new Date(t.last_sync_at).toLocaleString() : "Never"}
-                      </td>
-                      <td>
-                        <button
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => setSelectedTerminalForQR(t)}
-                        >
-                          Printable QR
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {terminals.map((t) => {
+                    const details = terminalDetailsMap[t.device_id];
+                    return (
+                      <tr key={t.id}>
+                        <td style={{ fontWeight: 600 }}>
+                          <code style={{ fontSize: "var(--text-xs)", background: "var(--color-bg)", padding: "2px 6px", borderRadius: 4 }}>
+                            {t.device_id}
+                          </code>
+                        </td>
+                        <td>
+                          <div style={{ fontWeight: 500 }}>{t.name}</div>
+                          <div className="text-xs text-muted">{t.location || "Unassigned"}</div>
+                        </td>
+                        <td>
+                          {t.public_key ? (
+                            <div>
+                              <span className="badge badge-success" style={{ fontSize: 11, padding: "2px 6px" }}>P-256 Registered</span>
+                              <div className="text-xs text-muted" style={{ fontFamily: "monospace", marginTop: 2 }}>
+                                {t.public_key.slice(0, 16)}...
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="badge badge-warning" style={{ fontSize: 11, padding: "2px 6px" }}>Key Pending</span>
+                          )}
+                        </td>
+                        <td>
+                          {details?.assignedSchedule ? (
+                            <div>
+                              <span style={{ fontWeight: 600 }}>{details.assignedSchedule.course_code}</span>
+                              <div className="text-xs text-muted">
+                                {details.assignedSchedule.day_name} • {details.assignedSchedule.time_slot}
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted">Unscheduled</span>
+                          )}
+                        </td>
+                        <td>
+                          {details?.activeSession ? (
+                            <div>
+                              <span className="badge badge-success" style={{ fontSize: 11, padding: "2px 6px" }}>
+                                Open: {details.activeSession.course_code}
+                              </span>
+                              <div className="text-xs text-muted" style={{ fontFamily: "monospace", marginTop: 2 }}>
+                                {details.activeSession.id.slice(0, 8)}...
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="badge badge-neutral" style={{ fontSize: 11, padding: "2px 6px", background: "var(--color-bg-subtle, #f1f5f9)", color: "var(--color-text-muted, #64748b)" }}>
+                              No Open Session
+                            </span>
+                          )}
+                        </td>
+                        <td>
+                          {details?.activeSession ? (
+                            <div>
+                              <span style={{ fontWeight: 600 }}>{details.enrolledKeyCount}</span>
+                              <span className="text-xs text-muted"> active keys</span>
+                            </div>
+                          ) : (
+                            <span className="text-xs text-muted">—</span>
+                          )}
+                        </td>
+                        <td>
+                          <div>
+                            {t.is_active ? (
+                              <span className="badge badge-success">Operational</span>
+                            ) : (
+                              <span className="badge badge-danger">Deactivated</span>
+                            )}
+                            <span className="text-xs text-muted" style={{ marginLeft: 6 }}>
+                              v{t.provisioned_version || 1}
+                            </span>
+                          </div>
+                          <div className="text-xs text-muted" style={{ marginTop: 2 }}>
+                            {t.last_sync_at ? new Date(t.last_sync_at).toLocaleString() : "Never synced"}
+                          </div>
+                        </td>
+                        <td>
+                          <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: "3px 7px", fontSize: 11 }}
+                              title="Register or update terminal P-256 public key"
+                              onClick={() => handleOpenEditKey(t)}
+                            >
+                              🔑 Key
+                            </button>
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: "3px 7px", fontSize: 11 }}
+                              title="Trigger reprovisioning at next Wi-Fi connection"
+                              onClick={() => handleTriggerReprovision(t)}
+                            >
+                              🔄 Reprovision
+                            </button>
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: "3px 7px", fontSize: 11 }}
+                              title="Export SD Card provisioning bundle (/terminal_config.json + /enrolled_keys.csv)"
+                              onClick={() => handleOpenBundleModal(t)}
+                            >
+                              📥 SD Bundle
+                            </button>
+                            <button
+                              className="btn btn-secondary btn-sm"
+                              style={{ padding: "3px 7px", fontSize: 11 }}
+                              onClick={() => setSelectedTerminalForQR(t)}
+                            >
+                              QR
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             )}
@@ -1224,6 +1509,190 @@ export function DeviceManagement() {
                 disabled={submittingReview}
               >
                 {submittingReview ? "Saving..." : "Save Review Decision"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Register / Update Terminal Public Key */}
+      {selectedTerminalForEditKey && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 540 }}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>Register Terminal Public Key</h3>
+              <button
+                className="modal-close"
+                onClick={() => setSelectedTerminalForEditKey(null)}
+                disabled={submittingKey}
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 13, fontWeight: 600 }}>Terminal: {selectedTerminalForEditKey.device_id} ({selectedTerminalForEditKey.name})</div>
+                <div className="text-xs text-muted">Location: {selectedTerminalForEditKey.location || "Unassigned"}</div>
+              </div>
+
+              <div style={{ background: "var(--color-bg)", padding: 12, borderRadius: 6, marginBottom: 14, fontSize: 12, lineHeight: 1.5 }}>
+                ℹ️ <strong>Security Requirement:</strong> Only authorized administrators can register or update the physical terminal's NIST P-256 public key. The terminal signs challenge packets, durable check-in receipts, and time-provenance statements using the private key stored securely in its firmware/NVS.
+              </div>
+
+              {selectedTerminalForEditKey.public_key && (
+                <div style={{ marginBottom: 12 }}>
+                  <label className="text-xs text-muted" style={{ display: "block", marginBottom: 2 }}>Current Registered Key (SPKI Base64)</label>
+                  <pre style={{ fontSize: 11, background: "var(--color-bg)", padding: 8, borderRadius: 4, overflowX: "auto", margin: 0, wordBreak: "break-all", whiteSpace: "pre-wrap" }}>
+                    {selectedTerminalForEditKey.public_key}
+                  </pre>
+                </div>
+              )}
+
+              <div style={{ marginBottom: 14 }}>
+                <label className="text-xs text-muted" style={{ display: "block", marginBottom: 4 }}>
+                  NIST P-256 SPKI Public Key (Base64) *
+                </label>
+                <textarea
+                  className="input input-sm"
+                  rows={4}
+                  style={{ width: "100%", fontFamily: "monospace", fontSize: 12, resize: "vertical" }}
+                  placeholder="MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE..."
+                  value={newTerminalKey}
+                  onChange={(e) => setNewTerminalKey(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn btn-secondary btn-sm"
+                onClick={() => setSelectedTerminalForEditKey(null)}
+                disabled={submittingKey}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={handleSaveTerminalKey}
+                disabled={submittingKey || !newTerminalKey.trim()}
+              >
+                {submittingKey ? "Saving..." : "Register & Bind Public Key"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: Export SD Card Provisioning Bundle */}
+      {selectedTerminalForBundle && (
+        <div className="modal-overlay">
+          <div className="modal" style={{ maxWidth: 600 }}>
+            <div className="modal-header">
+              <h3 style={{ margin: 0 }}>SD Provisioning Bundle — {selectedTerminalForBundle.device_id}</h3>
+              <button
+                className="modal-close"
+                onClick={() => setSelectedTerminalForBundle(null)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="modal-body">
+              {bundleLoading ? (
+                <div style={{ textAlign: "center", padding: 24 }}>Loading provisioning bundle from server...</div>
+              ) : bundleData ? (
+                <div>
+                  <div style={{ background: "var(--color-bg)", padding: 12, borderRadius: 6, marginBottom: 14, fontSize: 12 }}>
+                    💾 <strong>Offline Boot Instructions:</strong> Copy <code>/terminal_config.json</code> and <code>/enrolled_keys.csv</code> to the root of the terminal's MicroSD card before powering on in an offline lecture hall.
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+                    <div style={{ background: "var(--color-bg)", padding: 10, borderRadius: 6 }}>
+                      <div className="text-xs text-muted">Provisioning Version</div>
+                      <div style={{ fontWeight: 700, fontSize: 16 }}>v{bundleData.provisioned_version}</div>
+                    </div>
+                    <div style={{ background: "var(--color-bg)", padding: 10, borderRadius: 6 }}>
+                      <div className="text-xs text-muted">Active Session</div>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>
+                        {bundleData.active_session ? bundleData.active_session.course_code : "None (Closed)"}
+                      </div>
+                    </div>
+                  </div>
+
+                  {bundleData.active_session ? (
+                    <div style={{ marginBottom: 14 }}>
+                      <div className="text-xs text-muted" style={{ marginBottom: 4 }}>Active Session Details:</div>
+                      <pre style={{ fontSize: 11, background: "var(--color-bg)", padding: 8, borderRadius: 4, margin: 0 }}>
+                        {JSON.stringify(bundleData.active_session, null, 2)}
+                      </pre>
+                    </div>
+                  ) : (
+                    <div style={{ background: "#fef3c7", color: "#92400e", padding: 10, borderRadius: 6, fontSize: 12, marginBottom: 14 }}>
+                      ⚠️ <strong>No Active Session:</strong> No class is currently open for this terminal. The exported <code>/terminal_config.json</code> will have <code>active_session: null</code> and the ESP32 will withhold biometric attendance until a session is opened.
+                    </div>
+                  )}
+
+                  <div style={{ marginBottom: 14 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                      <span className="text-xs text-muted">Enrolled Student Keys ({bundleData.enrolled_keys?.length || 0}):</span>
+                    </div>
+                    {bundleData.enrolled_keys?.length === 0 ? (
+                      <div className="text-xs text-muted">No students currently enrolled for this session.</div>
+                    ) : (
+                      <div style={{ maxHeight: 120, overflowY: "auto", background: "var(--color-bg)", padding: 8, borderRadius: 4 }}>
+                        {bundleData.enrolled_keys?.slice(0, 10).map((k: any) => (
+                          <div key={k.student_id} className="text-xs" style={{ display: "flex", justifyContent: "space-between", padding: "2px 0" }}>
+                            <span>{k.matric_number || k.student_id.slice(0, 8)}</span>
+                            <code style={{ fontSize: 10 }}>{k.credential_id ? k.credential_id.slice(0, 16) : k.public_key.slice(0, 16)}...</code>
+                          </div>
+                        ))}
+                        {bundleData.enrolled_keys?.length > 10 && (
+                          <div className="text-xs text-muted" style={{ textAlign: "center", paddingTop: 4 }}>
+                            + {bundleData.enrolled_keys.length - 10} more students
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 16 }}>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        const configJson = JSON.stringify({
+                          terminal_id: bundleData.terminal_id,
+                          provisioning_version: bundleData.provisioned_version,
+                          active_session: bundleData.active_session,
+                        }, null, 2);
+                        downloadJsonFile(`terminal_config_${bundleData.terminal_id}.json`, configJson);
+                      }}
+                    >
+                      📥 Download /terminal_config.json
+                    </button>
+                    <button
+                      className="btn btn-secondary btn-sm"
+                      style={{ flex: 1 }}
+                      onClick={() => {
+                        let csvText = "student_id,matric_number,public_key,credential_id,algorithm\n";
+                        for (const k of (bundleData.enrolled_keys || [])) {
+                          csvText += `${k.student_id},${k.matric_number},${k.public_key},${k.credential_id},${k.algorithm}\n`;
+                        }
+                        downloadCsvFile(`enrolled_keys_${bundleData.terminal_id}.csv`, csvText);
+                      }}
+                    >
+                      📥 Download /enrolled_keys.csv
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div>Failed to load bundle data.</div>
+              )}
+            </div>
+            <div className="modal-footer">
+              <button
+                className="btn btn-primary btn-sm"
+                onClick={() => setSelectedTerminalForBundle(null)}
+              >
+                Done
               </button>
             </div>
           </div>
